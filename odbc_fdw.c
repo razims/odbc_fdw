@@ -1022,7 +1022,7 @@ static Oid oid_from_server_name(char *serverName)
 		elog(ERROR, "oid_from_server_name: Get server name from Oid query Failed, SP_exec returned %d.", ret);
 	}
 
-	if (SPI_tuptable->vals[0] != NULL)
+	if (SPI_processed > 0 && SPI_tuptable->vals[0] != NULL)
 	{
 		tupdesc  = SPI_tuptable->tupdesc;
 		tuple    = SPI_tuptable->vals[0];
