@@ -1,36 +1,11 @@
-# ⚠️ ARCHIVED - This repository is no longer maintained
-
-**This repository has been archived and is no longer actively maintained.**
-
-This project was last updated on 2023-02-10 and is preserved for historical reference only.
-
-- 🔒 **Read-only**: No new issues, pull requests, or changes will be accepted
-- 📦 **No support**: This code is provided as-is with no support or updates
-- 🔍 **For reference only**: You may fork this repository if you wish to continue development
-
-For current CARTO projects and actively maintained repositories, please visit: https://github.com/CartoDB
-
----
-
-ODBC FDW for PostgreSQL 9.5+ 
-============================
-[![Travis Build Status](https://travis-ci.org/CartoDB/odbc_fdw.svg?branch=master)](https://travis-ci.org/CartoDB/odbc_fdw)
-[![AppVeyor Build Status](https://ci.appveyor.com/api/projects/status/github/CartoDB/odbc_fdw?branch=master&svg=true)](https://ci.appveyor.com/project/alberhander/odbc-fdw "Get your fresh Windows build here!")
 
 This PostgreSQL extension implements a Foreign Data Wrapper (FDW) for
 remote databases using Open Database Connectivity [ODBC](http://msdn.microsoft.com/en-us/library/ms714562(v=VS.85).aspx).
 
 This was originally developed by Zheng Yang in 2011,
 with contributions by Gunnar "Nick" Bluth from 2014
-and further developed by CARTO since 2016.
-
-While we don’t provide direct technical support to Open Source
-installations, it is possible to engage in technical conversations
-with the community and part of the CARTO team (including some team
-members like Solutions, Support, Backend, and Frontend engineers) in
-our [Google Groups
-forum](https://groups.google.com/forum/#!forum/cartodb) and [GIS Stack
-Exchange](https://gis.stackexchange.com/questions/tagged/carto).
+and further developed by CARTO since 2016. I fixed the code
+with the help of Claude to support recent PostgreSQL Releases.
 
 Requirements
 ------------
@@ -38,7 +13,7 @@ Requirements
 To compile and install this extension, assuming a Linux OS,
 the libraries and header files for ODBC and PostgreSQL are needed,
 e.g. in Ubuntu this can be provided by the `unixodbc-dev`
-and `postgresql-server-dev-9.5` system packages.
+and `postgresql19-devel` system packages.
 
 To make use of the extension ODBC drivers for the data sources to
 be used must be installed in the system and reflected
@@ -200,7 +175,7 @@ LIMITATIONS
 -----------
 
 * Column, schema, table names should not be longer than the limit stablished by
-  PostgreSQL ([NAMEDATALEN](https://www.postgresql.org/docs/9.5/static/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS))
+  PostgreSQL ([NAMEDATALEN](https://www.postgresql.org/docs/devel/sql-syntax-lexical.html))
 * Only the following column types are currently fully suported:
   - SQL_CHAR
   - SQL_WCHAR
@@ -225,4 +200,4 @@ LIMITATIONS
 * Foreign encodings are supported with the  `encoding` option
   for any enconding supported by PostgreSQL and compatible with the
   local database. The encoding must be identified with the
-  name used by [PostgreSQL](https://www.postgresql.org/docs/9.5/static/multibyte.html).
+  name used by [PostgreSQL](https://www.postgresql.org/docs/current/multibyte.html).
