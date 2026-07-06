@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.0
+Released 2026-07-06
+- Fix builds and crashes against recent PostgreSQL versions
+
 ## 0.5.2.3
 Released 2020-11-09
 
