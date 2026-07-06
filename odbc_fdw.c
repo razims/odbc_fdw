@@ -30,6 +30,10 @@
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= 180000
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
+#endif
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "utils/memutils.h"
@@ -65,9 +69,14 @@
 #define strcasecmp _stricmp
 #endif
 
-/* TupleDescAttr was backported into 9.5.9 and 9.6.5 but we support any 9.5.X */
+/* TupleDescAttr was backported into 9.5.9 and 9.6.5 but we support any 9.5.X.
+ * On PG18+, TupleDescAttr is a real (non-macro) inline function and
+ * TupleDescData no longer has an "attrs" member, so #ifndef TupleDescAttr
+ * is not a safe guard any more - gate on PG_VERSION_NUM instead. */
+#if PG_VERSION_NUM < 90605
 #ifndef TupleDescAttr
 #define TupleDescAttr(tupdesc, i) ((tupdesc)->attrs[(i)])
+#endif
 #endif
 
 #include "executor/spi.h"
@@ -1358,6 +1367,9 @@ static void odbcGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid fore
 	                 NULL, /* PathTarget */
 #endif
 	                 baserel->rows,
+#if PG_VERSION_NUM >= 180000
+	                 0, /* disabled_nodes */
+#endif
 	                 startup_cost,
 	                 total_cost,
 	                 NIL, /* no pathkeys */
