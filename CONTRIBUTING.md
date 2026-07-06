@@ -1,5 +1,5 @@
 The development tracker for odbc_fdw is on GitHub:
-http://github.com/cartodb/odbc_fdw
+http://github.com/devrimgunduz/odbc_fdw
 
 ---
 
@@ -21,7 +21,7 @@ There are several rules you should follow when a new pull request is created:
 - Title has to be descriptive. If you are fixing a bug don't use just the ticket title or number.
 - Explain what you have achieved in the description.
 - If you've added a new datasource, please put it in the description in order to include and configure it in travis so the tests could pass.
-- All tests [should pass](https://github.com/CartoDB/odbc_fdw/tree/master/test#how-to-execute-the-tests).
+- All tests [should pass](https://github.com/devrimgunduz/odbc_fdw/tree/master/test#how-to-execute-the-tests).
 
 # Bugs
 
@@ -34,4 +34,4 @@ Here're some good tips to make a good bug report:
 
 # Submitting contributions
 
-Before opening a pull request (or submitting a contribution) you will need to sign a Contributor License Agreement (CLA) before making a submission, [learn more here](https://carto.com/contributions).
+All contributions are welcome via [Github PR](https://github.com/devrimgunduz/odbc_fdw/pulls)
