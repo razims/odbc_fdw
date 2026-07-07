@@ -295,6 +295,8 @@ static void odbcConnStr(StringInfoData *conn_str, odbcFdwOptions* options);
 static char* get_schema_name(odbcFdwOptions *options);
 static inline bool is_blank_string(const char *s);
 static Oid oid_from_server_name(char *serverName);
+static char *escape_sql_literal(const char *value);
+static char *escape_sql_identifier_part(const char *value, const char *quote_char);
 
 /*
  * Check if string pointer is NULL or points to empty string
@@ -302,6 +304,70 @@ static Oid oid_from_server_name(char *serverName);
 static inline bool is_blank_string(const char *s)
 {
 	return s == NULL || s[0] == '\0';
+}
+
+/*
+ * Escape a value for safe use inside a single-quoted SQL string literal,
+ * by doubling every embedded single-quote character (the standard SQL
+ * escaping rule, e.g. "O'Brien" -> "O''Brien"). Returns a freshly palloc'd,
+ * NUL-terminated string; safe to call with value == NULL (returns "").
+ *
+ * This must be used for every value that gets interpolated into a SQL
+ * string sent to the remote ODBC data source, to avoid SQL injection.
+ */
+static char *
+escape_sql_literal(const char *value)
+{
+	StringInfoData buf;
+	const char *p;
+
+	initStringInfo(&buf);
+	if (value == NULL)
+		return buf.data;
+
+	for (p = value; *p; p++)
+	{
+		if (*p == '\'')
+			appendStringInfoChar(&buf, '\'');
+		appendStringInfoChar(&buf, *p);
+	}
+	return buf.data;
+}
+
+/*
+ * Escape a value for safe use as (part of) a quoted SQL identifier, by
+ * doubling every embedded occurrence of the driver-reported quote
+ * character (e.g. with quote_char='"', "foo""bar" -> "foo""""bar").
+ * quote_char is expected to be a single character (as returned by
+ * getQuoteChar()/getNameQualifierChar()); if it's blank, value is
+ * returned unescaped since there's no quoting to break out of. Returns a
+ * freshly palloc'd, NUL-terminated string; safe to call with value == NULL
+ * (returns "").
+ *
+ * This must be used for every table/schema/column name that gets
+ * interpolated into a SQL string sent to the remote ODBC data source, to
+ * avoid identifier-injection turning into arbitrary SQL injection.
+ */
+static char *
+escape_sql_identifier_part(const char *value, const char *quote_char)
+{
+	StringInfoData buf;
+	const char *p;
+	char qc;
+
+	initStringInfo(&buf);
+	if (value == NULL)
+		return buf.data;
+
+	qc = (quote_char != NULL && quote_char[0] != '\0') ? quote_char[0] : '\0';
+
+	for (p = value; *p; p++)
+	{
+		if (qc != '\0' && *p == qc)
+			appendStringInfoChar(&buf, qc);
+		appendStringInfoChar(&buf, *p);
+	}
+	return buf.data;
 }
 
 Datum
@@ -940,17 +1006,21 @@ odbcGetTableSize(odbcFdwOptions* options, unsigned int *size)
 		initStringInfo(&sql_str);
 		if (is_blank_string(options->sql_query))
 		{
+			char *escaped_table = escape_sql_identifier_part(options->table, quote_char.data);
+
 			if (is_blank_string(schema_name))
 			{
 				appendStringInfo(&sql_str, "SELECT COUNT(*) FROM %s%s%s",
-				                 quote_char.data, options->table, quote_char.data);
+				                 quote_char.data, escaped_table, quote_char.data);
 			}
 			else
 			{
+				char *escaped_schema = escape_sql_identifier_part(schema_name, quote_char.data);
+
 				appendStringInfo(&sql_str, "SELECT COUNT(*) FROM %s%s%s%s%s%s%s",
-				                 quote_char.data, schema_name, quote_char.data,
+				                 quote_char.data, escaped_schema, quote_char.data,
 				                 name_qualifier_char.data,
-				                 quote_char.data, options->table, quote_char.data);
+				                 quote_char.data, escaped_table, quote_char.data);
 			}
 		}
 		else
@@ -1007,7 +1077,8 @@ static int strtoint(const char *nptr, char **endptr, int base)
 static Oid oid_from_server_name(char *serverName)
 {
 	char *serverOidString;
-	char sql[1024];
+	char *escaped_name;
+	StringInfoData sql;
 	int serverOid;
 	HeapTuple tuple;
 	TupleDesc tupdesc;
@@ -1017,8 +1088,18 @@ static Oid oid_from_server_name(char *serverName)
 		elog(ERROR, "oid_from_server_name: SPI_connect returned %d", ret);
 	}
 
-	sprintf(sql, "SELECT oid FROM pg_foreign_server where srvname = '%s'", serverName);
-	if ((ret = SPI_execute(sql, true, 1)) != SPI_OK_SELECT) {
+	/*
+	 * serverName is an arbitrary, caller-supplied text argument (this
+	 * function backs SQL-callable functions such as odbc_tables_list()),
+	 * not a bounded identifier - build the query with a StringInfo
+	 * (grows as needed, no fixed-size buffer to overflow) and escape it
+	 * as a SQL string literal (doubling embedded quotes) to avoid SQL
+	 * injection via SPI_execute().
+	 */
+	escaped_name = escape_sql_literal(serverName);
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT oid FROM pg_foreign_server where srvname = '%s'", escaped_name);
+	if ((ret = SPI_execute(sql.data, true, 1)) != SPI_OK_SELECT) {
 		elog(ERROR, "oid_from_server_name: Get server name from Oid query Failed, SP_exec returned %d.", ret);
 	}
 
@@ -1542,22 +1623,29 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	else
 	{
 		/* Get options.table */
+		char *escaped_table = escape_sql_identifier_part(options.table, quote_char.data);
+
 		if (is_blank_string(schema_name))
 		{
 			appendStringInfo(&sql, "SELECT %s FROM %s%s%s", col_str.data,
-			                 (char *) quote_char.data, options.table, (char *) quote_char.data);
+			                 (char *) quote_char.data, escaped_table, (char *) quote_char.data);
 		}
 		else
 		{
+			char *escaped_schema = escape_sql_identifier_part(schema_name, quote_char.data);
+
 			appendStringInfo(&sql, "SELECT %s FROM %s%s%s%s%s%s%s", col_str.data,
-			                 (char *) quote_char.data, schema_name, (char *) quote_char.data,
+			                 (char *) quote_char.data, escaped_schema, (char *) quote_char.data,
 			                 (char *) name_qualifier_char.data,
-			                 (char *) quote_char.data, options.table, (char *) quote_char.data);
+			                 (char *) quote_char.data, escaped_table, (char *) quote_char.data);
 		}
 		if (pushdown)
 		{
+			char *escaped_key = escape_sql_identifier_part(qual_key, quote_char.data);
+			char *escaped_value = escape_sql_literal(qual_value);
+
 			appendStringInfo(&sql, " WHERE %s%s%s = '%s'",
-			                 (char *) quote_char.data, qual_key, (char *) quote_char.data, qual_value);
+			                 (char *) quote_char.data, escaped_key, (char *) quote_char.data, escaped_value);
 		}
 	}
 
