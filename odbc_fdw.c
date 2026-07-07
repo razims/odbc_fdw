@@ -627,6 +627,25 @@ odbc_fdw_validator(PG_FUNCTION_ARGS)
 			        ));
 		}
 
+		/*
+		 * The ODBC driver manager dlopen()s whatever shared library is
+		 * named by the "driver" attribute (and "dsn" indirectly selects
+		 * one via odbc.ini) - allowing an arbitrary value here is
+		 * equivalent to allowing an arbitrary shared library to be loaded
+		 * into the backend process. Restrict these two server-level
+		 * options to superusers, the same way core PostgreSQL restricts
+		 * comparably powerful FDW options (e.g. file_fdw's "filename").
+		 */
+		if (catalog == ForeignServerRelationId &&
+		    (strcmp(def->defname, "driver") == 0 || strcmp(def->defname, "dsn") == 0) &&
+		    !superuser())
+		{
+			ereport(ERROR,
+			        (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			         errmsg("only superusers can set the \"%s\" option of an odbc_fdw server",
+			                def->defname)));
+		}
+
 		/* TODO: detect redundant connection attributes and missing required attributs (dsn or driver)
 		 * Complain about redundent options
 		 */
@@ -952,19 +971,58 @@ static bool appendConnAttribute(bool sep, StringInfoData *conn_str, const char* 
 	return sep;
 }
 
+/*
+ * Is this ODBC connection attribute name one that typically carries a
+ * credential (password, secret/access key, token, etc.)? Used to keep
+ * such values out of the debug log - the connection string itself
+ * (used for the real SQLDriverConnect() call) is unaffected.
+ */
+static bool
+is_sensitive_connection_attribute(const char *attr_name)
+{
+	static const char *sensitive_names[] = {
+		"pwd", "password", "uid", "user", "accesskey", "secretkey",
+		"secret", "token", "apikey", "api_key", NULL
+	};
+	int i;
+
+	if (attr_name == NULL)
+		return false;
+
+	for (i = 0; sensitive_names[i]; i++)
+	{
+		if (strcasecmp(attr_name, sensitive_names[i]) == 0)
+			return true;
+	}
+	return false;
+}
+
 static void odbcConnStr(StringInfoData *conn_str, odbcFdwOptions* options)
 {
 	bool sep = false;
+	bool debug_sep = false;
 	ListCell *lc;
+	StringInfoData debug_str;
 
 	initStringInfo(conn_str);
+	initStringInfo(&debug_str);
 
 	foreach(lc, options->connection_list)
 	{
 		DefElem *def = (DefElem *) lfirst(lc);
-		sep = appendConnAttribute(sep, conn_str, get_odbc_attribute_name(def->defname), defGetString(def));
+		const char *attr_name = get_odbc_attribute_name(def->defname);
+		const char *value = defGetString(def);
+
+		sep = appendConnAttribute(sep, conn_str, attr_name, value);
+
+		/*
+		 * Build a separate, redacted copy purely for the debug log, so a
+		 * -DDEBUG build never writes credentials to the server log.
+		 */
+		debug_sep = appendConnAttribute(debug_sep, &debug_str, attr_name,
+		                                 is_sensitive_connection_attribute(attr_name) ? "***" : value);
 	}
-	elog_debug("CONN STR: %s", conn_str->data);
+	elog_debug("CONN STR: %s", debug_str.data);
 }
 
 /*
