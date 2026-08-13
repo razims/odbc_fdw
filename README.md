@@ -1,203 +1,425 @@
+# odbc_fdw — Softinent's ODBC foreign-data wrapper
 
-This PostgreSQL extension implements a Foreign Data Wrapper (FDW) for
-remote databases using Open Database Connectivity [ODBC](http://msdn.microsoft.com/en-us/library/ms714562(v=VS.85).aspx).
+A PostgreSQL extension that reads any [ODBC](https://learn.microsoft.com/sql/odbc/reference/odbc-programmer-s-reference)
+data source as foreign tables. This is **Softinent's maintained wrapper**: our
+release cadence, our resource ceilings, and a set of memory-safety fixes that
+the lineage it comes from does not have.
 
-This was originally developed by Zheng Yang in 2011,
-with contributions by Gunnar "Nick" Bluth from 2014
-and further developed by CARTO since 2016. I fixed the code
-with the help of Claude to support recent PostgreSQL Releases.
+Built and tested against **PostgreSQL 18**. Nothing here is version-specific
+beyond what PGXS provides, but 18 is the only major version this release has
+been compiled and exercised on, so it is the only one claimed.
 
-Requirements
-------------
+| | |
+| --- | --- |
+| Extension name | `odbc_fdw` |
+| This release | `1.0.0` — the git tag and `default_version` are the same string |
+| Licence | PostgreSQL licence, see [`LICENSE`](LICENSE) |
+| Requires | unixODBC (`libodbc`), plus an ODBC driver for whatever you are reading |
 
-To compile and install this extension, assuming a Linux OS,
-the libraries and header files for ODBC and PostgreSQL are needed,
-e.g. in Ubuntu this can be provided by the `unixodbc-dev`
-and `postgresql19-devel` system packages.
+---
 
-To make use of the extension ODBC drivers for the data sources to
-be used must be installed in the system and reflected
-in the `/etc/odbcinst.ini` file.
+## Provenance
 
-Driver requirements
---------------------
+This is not original work, and the lineage matters because the fixes below are
+defects **in that lineage** rather than local policy:
 
-- odbc-postgresql: >= 9.x
-- libmyodbc: >=  5.1
-- FreeTDS: >= 1.0
-- hive-odbc-native: >= 2.1
+- originally written by **Zheng Yang** in 2011, with a PostgreSQL Global
+  Development Group copyright;
+- updated for PostgreSQL 9.2+ by **Gunnar "Nick" Bluth**, based on `tds_fdw`
+  by Geoff Montee;
+- developed by **CARTO** from 2016 as
+  [`CartoDB/odbc_fdw`](https://github.com/CartoDB/odbc_fdw), which was archived
+  on 2026-01-05;
+- carried forward by **Devrim Gündüz** as
+  [`devrimgunduz/odbc_fdw`](https://github.com/devrimgunduz/odbc_fdw), the
+  source of PGDG's `odbc_fdw_18` yum package;
+- **derived here from `devrimgunduz/odbc_fdw` at commit `ee741f5`, its tag
+  `0.6.1`.**
 
-Building and Installing
------------------------
+Every copyright notice from that lineage is retained in the files that carry
+it, and `LICENSE` is byte-identical to what we received. `Copyright (c) 2026,
+Softinent` is added *beside* those notices in the files we substantially
+modify, never in place of them. That is the licence's one condition, and it is
+not a formality — do not "tidy" any of it away.
 
-The extension can be built and installed with:
+The four defect fixes and the zero-column import refusal are candidates for
+upstreaming, and we intend to offer them. They are not offered yet, and nothing
+here waits on that: issues are disabled on `devrimgunduz/odbc_fdw`, so a pull
+request is the only channel there, and these fixes are load-bearing for a
+production warehouse today.
+
+Changes to this repository go to Softinent, not upstream. If you have arrived
+here looking for stock `odbc_fdw`, the two repositories above are it.
+
+---
+
+## Installing
 
 ```sh
-make
-sudo make install
+# Debian/Ubuntu build dependencies: PostgreSQL server headers, and unixODBC.
+apt-get install -y build-essential postgresql-server-dev-18 unixodbc-dev
+
+make USE_PGXS=1
+sudo make install USE_PGXS=1
 ```
 
-Usage
------
+`USE_PGXS=1` is inert at this release — the Makefile includes
+`$(PG_CONFIG) --pgxs` unconditionally — and is accepted so that the usual
+invocation works. Point the build at a specific installation with
+`PG_CONFIG=/path/to/pg_config`; on Debian and its derivatives that is
+`/usr/lib/postgresql/18/bin/pg_config`, not anything under `/usr/local`.
 
-The `OPTION` clause of the `CREATE SERVER`, `CREATE FOREIGN TABLE`
-and  `IMPORT FOREIGN SCHEMA` commands is used to define both
-the ODBC attributes to define a connection to an ODBC data source
-and some additional parameters to specify the table or query that
-will be accessed as a foreign table.
+`SHLIB_LINK = -lodbc` links against the unixODBC **driver manager**, which is
+all the build needs. The runtime package on Debian 13 is `libodbc2`
+(`libodbc.so.2`); `libodbc1` does not exist there. A **driver** for the remote —
+psqlODBC, FreeTDS, SAP's `libodbcHDB.so`, anything else — is loaded by the
+driver manager at connect time, so it is not needed to build, nor to run
+`CREATE EXTENSION`, and its absence surfaces only at the first foreign scan
+as `[unixODBC][Driver Manager] Can't open lib`.
 
-The following options to define ODBC attributes should be defined in
-the server definition (`CREATE SERVER`).
+Drivers must be registered in `/etc/odbcinst.ini`. `odbcinst -q -d` lists what
+the driver manager can actually see, which is the only check that reads that
+file the way a connection will.
 
-option   | description
--------- | -----------
-`dsn`    | The Database Source Name of the foreign database system you're connecting to.
-`driver` | The name of the ODBC driver to use (needed if no dsn is used)
-
-Any other ODBC connection attribute is driver-dependent, and should be defined by
-an option named as the attribute prepended by the prefix `odbc_`.
-For example `odbc_server`,   `odbc_port`, `odbc_uid`, `odbc_pwd`, etc.
-
-The DSN and Driver can also be defined by the prefixed options
-`odbc_DSN`  and `odbc_DRIVER` repectively.
-
-The odbc_ prefixed options can be defined either in the server, user mapping
-or foreign table statements.
-
-If the ODBC driver requires case-sensitive attribute names, the
-`odbc_` option names will have to be quoted with double quotes (`""`),
-for example `OPTIONS ( "odbc_SERVER" '127.0.0.1' )`.
-Attributes `DSN`, `DRIVER`, `UID` and `PWD` are automatically uppercased
-and don't need quoting.
-
-If an ODBC attribute value contains special characters such as `=` or `;`
-it will require quoting with curly braces (`{}`), for example:
-for example `OPTIONS ( "odbc_PWD" '{xyz=abc}' )`.
-
-odbc_ option names may need to be quoted with "" if the driver
-requires case-sensitive names (otherwise the names are passed as lowercase,
-except for UID & PWD)
-odbc_ option values may need to be quoted with {} if they contain
-characters such as =; ...
-(but PG driver doesn't seem to support them)
-(the driver name and DNS should always support this quoting, since they aren't
-handled by the driver)
-
-
-Usually you'll want to define authentication-related attributes
-in a `CREATE USER MAPPING` statement, so that they are determined by
-the connected PostgreSQL role, but that's not a requirement: any attribute
-can be define in any of the statements; when a foreign table is access
-the SERVER, USER MAPPING and FOREIGN TABLE options will be combined
-to produce an ODBC connection string.
-
-The next options are used to define the table or query to connect a
-foreign table to. They should be defined either in `CREATE FOREIGN TABLE`
-or `IMPORT FOREIGN SCHEMA` statements:
-
-option     | description
----------- | -----------
-`schema`   | The schema of the database to query.
-`table`    | The name of the table to query. Also the name of the foreign table to create in the case of queries.
-`sql_query`| Optional: User defined SQL statement for querying the foreign table(s). This overrides the `table` parameters. This should use the syntax of ODBC driver used.
-`sql_count`| Optional: User defined SQL statement for counting number of records in the foreign table(s). This should use the syntax of ODBC driver used.
-`prefix`   | For IMPORT FOREIGN SCHEMA: a prefix for foreign table names. This can be used to prepend a prefix to the names of tables imported from an external database.
-
-Note that if the `prefix` option is used and only one specific foreign table is to be imported,
-the `table` option is necessary (to specify the unprefixed, remote table name). In this case
-it is better not to include a `LIMIT TO` clause (otherwise it has to reference the *prefixed* table name).
-
-Example
--------
-
-Assuming that the `odbc_fdw` is installed and available
-in your database (`CREATE EXTENSION odbc_fdw`), and that
-you have a DNS `test` defined for some ODBC datasource which
-has a table named `dblist` in a schema named `test`:
+Then, per database:
 
 ```sql
-CREATE SERVER odbc_server
-  FOREIGN DATA WRAPPER odbc_fdw
-  OPTIONS (dsn 'test');
-
-CREATE FOREIGN TABLE
-  odbc_table (
-    id integer,
-    name varchar(255),
-    desc text,
-    users float4,
-    createdtime timestamp
-  )
-  SERVER odbc_server
-  OPTIONS (
-    odbc_DATABASE 'myplace',
-    schema 'test',
-    sql_query 'select description,id,name,created_datetime,sd,users from `test`.`dblist`',
-    sql_count 'select count(id) from `test`.`dblist`'
-  );
-
-CREATE USER MAPPING FOR postgres
-  SERVER odbc_server
-  OPTIONS (odbc_UID 'root', odbc_PWD '');
+CREATE EXTENSION odbc_fdw;
 ```
 
-Note that no DSN is required; we can define connection attributes,
-including the name of the ODBC driver, individually:
+---
+
+## Usage
+
+Connection state is spread across three objects and concatenated when a
+foreign table is read: the **server**, the **user mapping** for the connecting
+role, and the **foreign table** itself.
+
+### The `odbc_` prefix — read this before naming any option
+
+An option named `odbc_<something>` is **passed straight through to the ODBC
+connection string** as a driver attribute. It is not interpreted by this
+extension at all.
 
 ```sql
-CREATE SERVER odbc_server
-  FOREIGN DATA WRAPPER odbc_fdw
-  OPTIONS (
-    odbc_DRIVER 'MySQL',
-	odbc_SERVER '192.168.1.17',
-	encoding 'iso88591'
-  );
+CREATE SERVER src FOREIGN DATA WRAPPER odbc_fdw OPTIONS (
+  odbc_driver     'PostgreSQL Unicode',   -- becomes DRIVER=...
+  odbc_servername '10.0.0.5',             -- becomes servername=...
+  odbc_port       '5432');
 ```
 
-The need to know about the columns of the table(s) to be queried
-ad its types can be obviated by using the `IMPORT FOREIGN SCHEMA`
-statement. By using the same OPTIONS as for `CREATE FOREIGN TABLE`
-we can import as a foreign table the results of an arbitrary
-query performed through the ODBC driver:
+Three consequences that are easy to get wrong, all measured:
+
+1. **The prefix is matched case-sensitively.** `is_odbc_attribute` compares it
+   with `strncmp`, so a name whose *prefix* carries capitals is not recognised
+   as a connection attribute. On a server or a user mapping that is refused
+   outright (`ERROR: invalid option "ODBC_UID"`); on a **foreign table** it is
+   accepted **silently**, because a table's options double as column mappings,
+   so the name simply becomes one and does nothing.
+2. **PostgreSQL folds an unquoted option name to lower case before this
+   wrapper sees it**, so `odbc_DRIVER` and `odbc_driver` are the same option and
+   both work. The case-sensitivity above therefore only bites when the name is
+   double-quoted — `"ODBC_SERVERNODE"` is refused, `odbc_SERVERNODE` is not.
+   Writing every name in lower case sidesteps the whole question.
+3. `DSN`, `DRIVER`, `UID` and `PWD` are normalised to upper case on the way to
+   the driver regardless. Any other attribute reaches the driver spelled as it
+   is stored, so a driver wanting case-sensitive attribute names needs the
+   option name double-quoted: `OPTIONS ("odbc_ServerName" '10.0.0.5')`.
+
+An attribute *value* containing `=` or `;` needs curly braces:
+`OPTIONS ("odbc_PWD" '{xyz=abc}')`.
+
+**Our own options are deliberately NOT `odbc_`-prefixed**, and that is a
+correctness requirement rather than a style choice: a prefixed name would be
+handed to the driver instead of being read here. Do not add one that is.
+
+### Credentials
+
+Put them in a user mapping, so they are chosen by the connecting PostgreSQL
+role:
 
 ```sql
-IMPORT FOREIGN SCHEMA test
-  FROM SERVER odbc_server
-  INTO public
-  OPTIONS (
-    odbc_DATABASE 'myplace',
-    table 'odbc_table', -- this will be the name of the created foreign table
-    sql_query 'select description,id,name,created_datetime,sd,users from `test`.`dblist`'
-  );
+CREATE USER MAPPING FOR someone SERVER src
+  OPTIONS (odbc_uid 'remote_login', odbc_pwd 'secret');
 ```
 
-LIMITATIONS
------------
+Any attribute may legally be set on any of the three objects, but a credential
+should only ever go here. A **server**'s options are readable by every role
+(`pg_foreign_server.srvoptions`) and travel in every `pg_dump`; a user
+mapping's are blanked for anyone but the server's owner
+(`pg_user_mappings.umoptions`). Since ODBC accepts `UID` and `PWD` in the
+connection string, a server option can legally *be* a password — which is why
+this wrapper offers no generic `option key=value` pass-through and why our
+ceilings refuse credential-shaped names.
 
-* Column, schema, table names should not be longer than the limit stablished by
-  PostgreSQL ([NAMEDATALEN](https://www.postgresql.org/docs/devel/sql-syntax-lexical.html))
-* Only the following column types are currently fully suported:
-  - SQL_CHAR
-  - SQL_WCHAR
-  - SQL_VARCHAR
-  - SQL_WVARCHAR
-  - SQL_LONGVARCHAR
-  - SQL_WLONGVARCHAR
-  - SQL_DECIMAL
-  - SQL_NUMERIC
-  - SQL_INTEGER
-  - SQL_REAL
-  - SQL_FLOAT
-  - SQL_DOUBLE
-  - SQL_SMALLINT
-  - SQL_TINYINT
-  - SQL_BIGINT
-  - SQL_DATE
-  - SQL_TYPE_TIME
-  - SQL_TIME
-  - SQL_TIMESTAMP
-  - SQL_GUID
-* Foreign encodings are supported with the  `encoding` option
-  for any enconding supported by PostgreSQL and compatible with the
-  local database. The encoding must be identified with the
-  name used by [PostgreSQL](https://www.postgresql.org/docs/current/multibyte.html).
+### Pointing a foreign table at the remote
+
+| option | where | description |
+| --- | --- | --- |
+| `schema` | table, import | remote schema to read from |
+| `table` | table, import | remote table; also the local name for a `sql_query` table |
+| `sql_query` | table, import | SQL to run instead of reading `table`, in the remote's own dialect |
+| `sql_count` | table | SQL to count rows, for planner estimates |
+| `prefix` | import | prefix for the names of imported foreign tables |
+| `dsn` | server | Data Source Name, if you use one |
+| `driver` | server | driver name, if you do not |
+| `encoding` | server, table | remote encoding, named as PostgreSQL names it |
+
+Anything else on a foreign table that is not one of ours and not `odbc_`-prefixed
+is taken as a **column name mapping**. That is why an unrecognised table option
+is silently accepted, and why our option names are claimed explicitly before
+that fallthrough.
+
+```sql
+CREATE FOREIGN TABLE ext.orders (
+    id      integer,
+    label   text,
+    created timestamp)
+  SERVER src
+  OPTIONS (schema 'sales', "table" 'orders');
+```
+
+`IMPORT FOREIGN SCHEMA` reads the remote's own metadata instead:
+
+```sql
+IMPORT FOREIGN SCHEMA sales LIMIT TO ("Orders") FROM SERVER src INTO ext;
+```
+
+**Double-quote the names in `LIMIT TO`.** PostgreSQL folds an unquoted
+identifier to lower case before this wrapper is reached, and against a remote
+that folds *up* — SAP HANA, Oracle, DB2 — the folded name does not exist there.
+The names in `LIMIT TO` are taken verbatim from the parsed statement and are
+**not** checked against the remote, unlike the enumerated and `EXCEPT` paths,
+which build their list from `SQLTables`. Upstream therefore accepted a name the
+remote had never had and created a foreign table with no columns; this release
+refuses that (see below), but it can only diagnose — the name is already folded
+by the time it arrives, so nothing here can recover what was meant.
+
+---
+
+## Our options: resource ceilings
+
+Two of them, both intended for a shared warehouse where a foreign table points
+at somebody else's production database:
+
+| option | unit | default | refuses |
+| --- | --- | --- | --- |
+| `max_field_size` | bytes | `0` (unlimited) | any single field value larger than this |
+| `max_row_count` | rows | `0` (unlimited) | a scan returning more rows than this |
+
+```sql
+CREATE SERVER src FOREIGN DATA WRAPPER odbc_fdw OPTIONS (
+  odbc_driver 'HDBODBC', odbc_servernode 'host:30015',
+  max_field_size '1048576',    -- 1 MiB
+  max_row_count  '10000000');
+```
+
+Rules that apply to every one of them, and to any added later:
+
+- **Valid on a foreign server and on a foreign table**, not on a user mapping.
+- **Non-negative integer**, no unit suffixes. `0` means unlimited and is the
+  default, so a configuration that sets none behaves exactly as it did before
+  these existed.
+- **Validated at DDL time**, in the validator, so `CREATE SERVER` and
+  `CREATE FOREIGN TABLE` refuse a bad value instead of reporting success and
+  failing later in an unrelated query:
+  `ERROR: option "max_row_count" requires a non-negative integer, got "lots"`.
+- **Tightest wins.** A table may lower a ceiling its server sets; it can never
+  raise one. `0` on a table does not lift a server's ceiling. This is
+  deliberately not the last-wins resolution upstream uses for every other
+  option: a ceiling that can be raised from the object it constrains is not a
+  ceiling, and folding to the minimum also makes the outcome independent of the
+  order in which the option lists happen to be concatenated.
+- **They refuse rather than truncating.** Returning the first N rows of a
+  larger result, or a shortened field, is a wrong answer, which is worse than
+  no answer.
+
+**What they do not do.** The ODBC driver runs **inside the PostgreSQL backend**.
+A fault in the driver is a `SIGSEGV`, and PostgreSQL's response to a backend
+dying on a signal is to SIGQUIT every other backend and replay WAL — so it is
+crash recovery for **every session in every database on the instance**, not one
+failed query. No option here changes that; only a process boundary would. These
+ceilings bound what a runaway *remote* can make **this extension** allocate,
+which makes such a remote survivable. They are not isolation and must not be
+described as if they were.
+
+---
+
+## What this release fixes relative to `ee741f5`
+
+Four defects, each measured against a real SAP HANA 2.0 tenant, and the first
+two independently reproduced against psqlODBC — so they are defects in the
+wrapper, not quirks of one driver. The commit messages carry the measurements;
+`git log` is the reference, and this is the summary.
+
+1. **An empty catalog separator produced a malformed identifier.**
+   `getNameQualifierChar` asks the driver for `SQL_CATALOG_NAME_SEPARATOR` and
+   used the answer verbatim to join a *schema* to a table name. Those are not
+   the same thing: a database with no catalogs may correctly report it empty,
+   and HANA does. The emitted text was `"SYS""DUMMY"` — one identifier
+   containing an escaped quote. Now defaults to `.`, in the one function both
+   call sites use, so the failure cannot move one step later into the scan.
+
+2. **`values[]` was undersized, misindexed and uninitialised.** It was
+   `palloc`'d by the number of *result* columns while every write indexes it by
+   position in the *foreign table*, and `BuildTupleFromCStrings` reads `natts`
+   entries regardless — so a table with more columns than the query returns
+   overran the allocation. And `palloc` does not zero, while a result column
+   matching no table column is skipped, leaving its slot uninitialised for
+   `BuildTupleFromCStrings` to dereference as a C string. That single read of
+   undefined memory accounts for the whole original symptom set: correct row and
+   column counts with wrong values — a literal arriving empty, a known `'X'`
+   arriving NULL, an integer arriving `""`, schema names arriving as `\x03` —
+   and an intermittent `SIGSEGV`. Now `palloc0` sized by `natts`, which makes an
+   unmatched column a SQL NULL: the honest answer for a column the remote did
+   not return.
+
+3. **Result columns were matched to foreign-table columns case-sensitively.**
+   PostgreSQL folds identifiers down, HANA and Oracle and DB2 fold up, and the
+   code used `strcmp` — so a hand-written foreign table's columns could never
+   match, and were dropped from the mapping with no error at all. Now
+   `pg_strcasecmp`, PostgreSQL's own locale-independent ASCII compare.
+
+4. **Three errors in the chunked `SQLGetData` loop.** A control-flow decision
+   made by reading a chunk's last byte without regard for how many bytes the
+   driver wrote — uninitialised heap for any value shorter than the chunk. An
+   ODBC *indicator* (`SQL_NULL_DATA` = −1, `SQL_NO_TOTAL` = −4) added to a
+   running length total unchecked, driving it negative and running a
+   `strnlen(buffer, (size_t) -1)` on every NULL. And `SQL_NO_DATA` from a
+   continuation call treated as failure, which broke **every** `TIMESTAMP`,
+   with a bare "Reading data" error because `SQL_NO_DATA` carries no diagnostic
+   record.
+
+Plus, beyond the defects:
+
+5. **A large single field is cancellable.** `CHECK_FOR_INTERRUPTS()` inside the
+   chunked read, which is the one part of a scan PostgreSQL's own per-tuple
+   check cannot reach. There is deliberately **no** check at the row boundary,
+   and a comment in the source says so: `ExecScan` already checks once per
+   tuple, measured three ways. This bounds the loop, not the driver — a driver
+   blocking inside one `SQLGetData` still cannot be interrupted.
+
+6. **The retrieval path is bounds-checked**, so a wrong length from a driver
+   raises rather than corrupting memory: a negative buffer extent, a
+   non-positive `BufferLength` passed to `SQLGetData`, impossible
+   `resize_buffer` geometry, a 64-bit driver total truncating through `(int)`,
+   a write at `buffer[-1]`, and `binary_to_hex` overflowing `int`. Refused
+   rather than clamped throughout, because a length that has already gone wrong
+   means the arithmetic is wrong, and reading a different amount than the driver
+   was asked for would convert a detectable fault into a wrong answer.
+
+7. **`IMPORT FOREIGN SCHEMA` refuses to create a zero-column foreign table.**
+   `CREATE FOREIGN TABLE x () SERVER s` is something PostgreSQL accepts quite
+   happily, so an import could report success and leave an object that fails
+   only later, in somebody else's query, with an error about the remote rather
+   than about the import. It costs no extra remote work — `SQLColumns` has
+   already answered and the answer was being discarded — and the hint
+   distinguishes a name that was quoted from one PostgreSQL may have folded.
+
+---
+
+## Known defects, not fixed here
+
+Written down so they are not rediscovered in production. All three are
+pre-existing behaviour from the lineage, all three were observed while building
+this release, and none is fixed.
+
+1. **A cancelled or failed scan leaks the remote connection.**
+   `odbcEndForeignScan` is the only place the ODBC `env`/`dbc`/`stmt` handles
+   are freed, and the executor does not call it when a scan errors out — so
+   every error raised from inside a scan leaks a driver connection for the life
+   of the backend. Measured: three cancelled scans left three additional
+   sessions open on the remote. This is the one item here with a consequence on
+   **somebody else's server** that nothing on ours reveals, and connection
+   pooling makes it worse, because the backend outlives the client that caused
+   the scan. The fix, if taken, is a transaction or resource-owner callback, the
+   way `postgres_fdw` does it with `pgfdw_xact_callback`.
+
+2. **Reading one field is quadratic in its length.** `resize_buffer` allocates
+   and `memmove`s the whole accumulated value on *every* chunk, and chunks are
+   capped at 8192 bytes, so an *n*-byte value costs on the order of
+   *n²/16384* bytes of copying. Measured: a single 60,000,000-character NCLOB
+   took about 10 seconds to read, almost none of it waiting on the network. The
+   fix is to grow geometrically; the `TODO` already in the function says as much.
+
+3. **`SQL_VARBINARY` (−3) is not mapped, so `VARBINARY` arrives as hex text.**
+   `sql_data_type` maps only `SQL_LONGVARBINARY` (−4) to `bytea`, so a column
+   the driver reports as `SQL_VARBINARY` falls through to the text path and the
+   driver's hexadecimal *rendering* is stored as if it were the value. Measured:
+   `CAST('ABCD' AS VARBINARY(10))` read back as `\x3431343234333434` — the ASCII
+   of the string `"41424344"` — instead of `\x41424344`. `SQL_BINARY` (−2) is
+   presumably affected the same way and was not tested. A silent wrong *type*,
+   which is the same class as the defects above; unfixed only because changing a
+   type mapping changes existing foreign tables and needs measuring against more
+   than one driver.
+
+---
+
+## Versioning
+
+**One string, in both namespaces.** The annotated git tag and
+`default_version` in `odbc_fdw.control` are the same characters — `1.0.0` for
+this release. Upstream let those two drift (tag `0.6.1`, `default_version`
+`0.5.2`), which forces every consumer to carry both literals by hand and means
+nothing readable from SQL can identify the build. That is over.
+
+Ordinary semver from here, and **every release bumps it**:
+
+| change | bump |
+| --- | --- |
+| a C-only fix | patch |
+| a new option | minor |
+| anything that changes existing behaviour | major |
+
+Each bump renames the SQL script to `odbc_fdw--<new>.sql` and adds
+`odbc_fdw--<prev>--<new>.sql` so that `ALTER EXTENSION odbc_fdw UPDATE` works.
+For a C-only change that upgrade script is **empty**, and writing an empty file
+is the right thing to do: the alternative is telling operators to
+`DROP EXTENSION`, which `CASCADE`s away their foreign tables and every view
+built over them.
+
+`0.5.2` must never be declared again, by anything. A consumer gates on
+`default_version` appearing in an allowlist of builds whose data path has been
+measured correct, and stock upstream reports exactly `0.5.2` — so allowlisting
+that string would admit the build with the wrong values alongside the one with
+the right ones.
+
+---
+
+## Limitations
+
+- Column, schema and table names are subject to PostgreSQL's
+  [`NAMEDATALEN`](https://www.postgresql.org/docs/current/sql-syntax-lexical.html)
+  limit of 63 bytes, and a longer name is **truncated with only a notice**.
+- Read-only. There is no `INSERT`, `UPDATE` or `DELETE` path, and the wrapper
+  pushes down nothing but the query you write in `sql_query`.
+- Column types `IMPORT FOREIGN SCHEMA` can map, read from `sql_data_type`:
+  `SQL_CHAR`, `SQL_WCHAR`, `SQL_VARCHAR`, `SQL_WVARCHAR`, `SQL_LONGVARCHAR`,
+  `SQL_WLONGVARCHAR`, `SQL_DECIMAL`, `SQL_NUMERIC`, `SQL_INTEGER`, `SQL_REAL`,
+  `SQL_FLOAT`, `SQL_DOUBLE`, `SQL_BIT`, `SQL_SMALLINT`, `SQL_TINYINT`,
+  `SQL_BIGINT`, `SQL_DATE`, `SQL_TYPE_DATE`, `SQL_TIME`, `SQL_TYPE_TIME`,
+  `SQL_TIMESTAMP`, `SQL_TYPE_TIMESTAMP`, `SQL_GUID` and `SQL_LONGVARBINARY`.
+  Anything else is reported as a `NOTICE` and skipped. `SQL_BINARY` and
+  `SQL_VARBINARY` are **not** in that list — their arms are commented out
+  upstream with a `TODO` — which is the mechanism behind known defect 3 above.
+  (`SQL_BIT` is missing from upstream's own README; it is mapped, to `boolean`.)
+- Remote encodings are handled with the `encoding` option, for any encoding
+  PostgreSQL supports and that is compatible with the local database, named as
+  [PostgreSQL](https://www.postgresql.org/docs/current/multibyte.html) names it.
+
+---
+
+## Testing
+
+`test/` is upstream's regression harness, and it **needs a live ODBC source** —
+MySQL, SQL Server, Hive or PostgreSQL, registered in `odbcinst.ini`, with
+fixtures loaded and a connector config that upstream's CI supplied from an
+encrypted bundle. `make installcheck` and `make integration_tests` therefore do
+not run on a workstation, and the `.travis.yml` and `.appveyor.yml` that drove
+them belong to infrastructure we do not have. It is kept because it is the only
+description of what a multi-driver test would check; it is not a gate.
+
+What is runnable, and what this release was verified with, is in
+[`CLAUDE.md`](CLAUDE.md): a `postgres:18-trixie` container plus
+`postgresql-server-dev-18`, `unixodbc-dev` and `odbc-postgresql`, using
+psqlODBC pointed back at the container's own PostgreSQL as a real ODBC remote.
