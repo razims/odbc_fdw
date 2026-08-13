@@ -1970,11 +1970,60 @@ odbcIterateForeignScan(ForeignScanState *node)
 			{
 				resize_buffer(&buffer, &buffer_size, used_buffer_size, used_buffer_size + chunk_size);
 				ret = SQLGetData(stmt, i, target_type, buffer + used_buffer_size, chunk_size, &result_size);
-				effective_chunk_size = chunk_size;
-				if (!binary_data && buffer[used_buffer_size + chunk_size - 1] == 0)
+				if (ret == SQL_NO_DATA)
 				{
-					effective_chunk_size--;
+					/*
+					 * The column is exhausted, which is not an error.
+					 *
+					 * ODBC guarantees that a value can be retrieved across
+					 * SEVERAL SQLGetData calls only for character and binary
+					 * source types. Any other type rendered to SQL_C_CHAR gets
+					 * ONE call: the driver truncates, reports 01004 with the full
+					 * length, and then has no continuation to give. Measured
+					 * against SAP HANA, CURRENT_TIMESTAMP is exactly that -- a
+					 * driver-reported column size of 27 against a 29-byte
+					 * rendering:
+					 *   chunk=28 ret=1 rsize=29 state=01004   (27 bytes copied)
+					 *   chunk=3  ret=100                      (SQL_NO_DATA)
+					 * The loop then fell through to check_return, which rejects
+					 * SQL_NO_DATA because it is not SQL_SUCCEEDED, and every
+					 * timestamp failed with a bare "Reading data" and no driver
+					 * diagnostic -- SQL_NO_DATA carries no diagnostic record,
+					 * which is what made the message so uninformative.
+					 *
+					 * What was already copied IS the value, so terminate it and
+					 * stop. Terminating explicitly matters because the value is
+					 * consumed below as a C string: were SQL_NO_DATA to arrive on
+					 * the FIRST call, breaking without this would hand
+					 * appendStringInfoString an uninitialised buffer.
+					 */
+					resize_buffer(&buffer, &buffer_size, used_buffer_size, used_buffer_size + 1);
+					buffer[used_buffer_size] = 0;
+					ret = SQL_SUCCESS;
+					break;
 				}
+				/*
+				 * How much of this chunk is DATA.
+				 *
+				 * Was:
+				 *   effective_chunk_size = chunk_size;
+				 *   if (!binary_data && buffer[used_buffer_size + chunk_size - 1] == 0)
+				 *           effective_chunk_size--;
+				 * which read the chunk's last byte without consulting `ret` and
+				 * without regard for how many bytes SQLGetData actually wrote.
+				 * For any value shorter than the chunk -- the normal case, and
+				 * always so for a column whose declared width exceeds its
+				 * contents -- that byte is uninitialised heap, so a control-flow
+				 * decision depended on undefined memory.
+				 *
+				 * The test is also unnecessary. effective_chunk_size is read only
+				 * on the truncation arms below, which are reached only when the
+				 * driver really did fill the chunk, and SQL_C_CHAR output is
+				 * always NUL-terminated -- so a truncated character chunk carries
+				 * exactly chunk_size - 1 bytes of data. Binary data is not
+				 * terminated and uses the whole chunk.
+				 */
+				effective_chunk_size = binary_data ? chunk_size : chunk_size - 1;
 				truncation = result_truncation(ret, stmt);
 				if (truncation == STRING_TRUNCATION)
 				{
@@ -2022,7 +2071,21 @@ odbcIterateForeignScan(ForeignScanState *node)
 				}
 				else // NO_TRUNCATION: finish reading
 				{
-					used_buffer_size += result_size;
+					/*
+					 * result_size is an INDICATOR, not always a length:
+					 * SQL_NULL_DATA (-1) for a NULL value, SQL_NO_TOTAL (-4)
+					 * when the driver will not say. Adding it unchecked drove
+					 * used_buffer_size NEGATIVE, and the
+					 * strnlen(buffer, used_buffer_size) below then ran with a
+					 * (size_t)-1 bound -- an out-of-bounds scan on every NULL
+					 * value, which the SQL_NULL_DATA test further down was too
+					 * late to prevent. Clamping to chunk_size keeps the total
+					 * within what resize_buffer just guaranteed, so a driver
+					 * over-reporting a length cannot walk off the end either.
+					 */
+					if (result_size > 0)
+						used_buffer_size += (result_size > chunk_size)
+						                    ? chunk_size : (int) result_size;
 				}
 			} while (truncation == STRING_TRUNCATION && chunk_size > 0);
 
