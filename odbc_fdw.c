@@ -922,7 +922,12 @@ check_return(SQLRETURN ret, char *msg, SQLHANDLE handle, SQLSMALLINT type)
 static void
 getNameQualifierChar(SQLHDBC dbc, StringInfoData *nq_char)
 {
-	SQLCHAR name_qualifier_char[2];
+	/*
+	 * Zero-initialised: SQLGetInfo leaves this untouched if it fails, and the
+	 * blank test below has to be a test of what the driver said rather than of
+	 * whatever was on the stack.
+	 */
+	SQLCHAR name_qualifier_char[2] = {0, 0};
 
 	elog_debug("%s", __func__);
 
@@ -934,7 +939,28 @@ getNameQualifierChar(SQLHDBC dbc, StringInfoData *nq_char)
 	name_qualifier_char[1] = 0; // some drivers fail to copy the trailing zero
 
 	initStringInfo(nq_char);
-	appendStringInfo(nq_char, "%s", (char *) name_qualifier_char);
+	/*
+	 * Default a blank separator to ".".
+	 *
+	 * SQL_CATALOG_NAME_SEPARATOR describes how a CATALOG is joined to the name
+	 * that follows it, so a driver for a database with no catalogs may quite
+	 * correctly report it as empty -- SAP HANA's namespace is schema-based and
+	 * libodbcHDB does exactly that. Every caller here, however, uses this
+	 * string to join a SCHEMA to a table. Empty therefore emitted
+	 * "SYS""DUMMY", which is ONE identifier containing a doubled (escaped)
+	 * quote, resolved against the connecting user's default schema:
+	 *   Base table or view not found;259 invalid table name:
+	 *   Could not find table/view SYS"DUMMY in schema <CONNECTING USER'S SCHEMA>
+	 * Fixing it here rather than at a call site covers both places that build
+	 * a qualified name -- odbcGetTableSize and odbcBeginForeignScan -- so the
+	 * failure cannot simply move one step later. "." is the only separator SQL
+	 * defines between a schema and a table, and a driver that does report one
+	 * still gets its own.
+	 */
+	if (name_qualifier_char[0] == 0)
+		appendStringInfoString(nq_char, ".");
+	else
+		appendStringInfo(nq_char, "%s", (char *) name_qualifier_char);
 }
 
 /*
