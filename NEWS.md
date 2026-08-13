@@ -31,8 +31,8 @@ Added:
   cancellable;
 - bounds checks throughout the retrieval path, so a bad driver length raises
   instead of corrupting memory;
-- `max_field_size` and `max_row_count` resource ceilings, valid on a server and
-  a table, unlimited by default, tightest wins;
+- `max_field_size`, `max_row_count` and `max_result_size` resource ceilings,
+  valid on a server and a table, unlimited by default, tightest wins, per scan;
 - `IMPORT FOREIGN SCHEMA` refuses to create a zero-column foreign table.
 
 Removed: the six historical upgrade scripts, CARTO's `carto-package.json`, and

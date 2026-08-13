@@ -142,8 +142,9 @@ typedef struct odbcFdwOptions
 	 * driver attribute (see is_odbc_attribute), so an odbc_-prefixed name here
 	 * would be handed to the driver instead of being read by this extension.
 	 */
-	int64 max_field_size; /* refuse a single field value larger than this, bytes */
-	int64 max_row_count;  /* refuse a scan that returns more rows than this */
+	int64 max_field_size;  /* refuse a single field value larger than this, bytes */
+	int64 max_row_count;   /* refuse a scan that returns more rows than this */
+	int64 max_result_size; /* refuse a scan retrieving more than this in total, bytes */
 
 	List *connection_list; /* ODBC connection attributes */
 
@@ -162,6 +163,7 @@ typedef struct odbcFdwExecutionState
 	StringInfoData  *table_columns;
 	bool            first_iteration;
 	int64           row_count;   /* rows returned so far, for max_row_count */
+	int64           result_bytes; /* field bytes retrieved so far, for max_result_size */
 	/*
 	 * The remote query text, kept so that ReScanForeignScan can re-execute it.
 	 * It is the StringInfo odbcBeginForeignScan built, which was allocated in
@@ -214,10 +216,12 @@ static struct odbcFdwOption valid_options[] =
 	 * fallthrough -- a table option this table did not list would otherwise be
 	 * taken for the name of a remote column.
 	 */
-	{ "max_field_size", ForeignServerRelationId },
-	{ "max_field_size", ForeignTableRelationId },
-	{ "max_row_count",  ForeignServerRelationId },
-	{ "max_row_count",  ForeignTableRelationId },
+	{ "max_field_size",  ForeignServerRelationId },
+	{ "max_field_size",  ForeignTableRelationId },
+	{ "max_row_count",   ForeignServerRelationId },
+	{ "max_row_count",   ForeignTableRelationId },
+	{ "max_result_size", ForeignServerRelationId },
+	{ "max_result_size", ForeignTableRelationId },
 
 	/* Sentinel */
 	{ NULL,       InvalidOid}
@@ -243,6 +247,39 @@ result_truncation(SQLRETURN ret, SQLHSTMT stmt)
 		}
 	}
 	return truncation;
+}
+
+/*
+ * Enforce max_result_size: the total field bytes one scan may retrieve.
+ *
+ * max_field_size bounds ONE value and max_row_count bounds the number of rows,
+ * and a result set can sit comfortably inside both while being unbounded in
+ * aggregate -- 200 columns of 1KB across 10,000,000 rows violates neither. This
+ * is the ceiling on the product.
+ *
+ * done_bytes is what completed fields have already cost, field_bytes is the
+ * current field, and the comparison is written as a SUBTRACTION rather than as
+ * `done + field > max` deliberately: max_result_size is any non-negative int64
+ * an operator cares to type, and the invariant this function maintains is
+ * done_bytes <= max_result_size, so `max - done` is non-negative and the sum on
+ * the other side of the inequality is the one that could overflow.
+ *
+ * Called from two places for the same reason max_field_size is: once inside the
+ * chunk loop, where field_bytes is what has been assembled so far, so a runaway
+ * scan is refused while its last field is still being read rather than after;
+ * and once when a field's real length is known, which is the exact test. The
+ * message is the same in both, and says "at least", because in the first case
+ * the amount is a lower bound.
+ */
+static void
+check_result_size(int64 max_result_size, int64 done_bytes, int field_bytes)
+{
+	if (max_result_size > 0 && (int64) field_bytes > max_result_size - done_bytes)
+		ereport(ERROR,
+		        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+		         errmsg("odbc_fdw: scan has retrieved at least " INT64_FORMAT " bytes, exceeding max_result_size of " INT64_FORMAT,
+		                done_bytes + (int64) field_bytes, max_result_size),
+		         errhint("Raise or remove the \"max_result_size\" option on the foreign table or server.")));
 }
 
 /*
@@ -657,6 +694,12 @@ extract_odbcFdwOptions(List *options_list, odbcFdwOptions *extracted_options)
 			continue;
 		}
 
+		if (strcmp(def->defname, "max_result_size") == 0)
+		{
+			apply_limit_option(def, &extracted_options->max_result_size);
+			continue;
+		}
+
 		if (is_odbc_attribute(def->defname))
 		{
 			extracted_options->connection_list = lappend(extracted_options->connection_list, def);
@@ -812,7 +855,8 @@ odbc_fdw_validator(PG_FUNCTION_ARGS)
 		 * matter here, not the tightest-wins folding that extraction performs.
 		 */
 		if (strcmp(def->defname, "max_field_size") == 0 ||
-		    strcmp(def->defname, "max_row_count") == 0)
+		    strcmp(def->defname, "max_row_count") == 0 ||
+		    strcmp(def->defname, "max_result_size") == 0)
 		{
 			int64 sink = 0;
 			apply_limit_option(def, &sink);
@@ -1928,6 +1972,7 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->encoding = encoding;
 	/* festate comes from palloc, not palloc0, so this must be set explicitly */
 	festate->row_count = 0;
+	festate->result_bytes = 0;
 	festate->query = sql.data;
 	node->fdw_state = (void *) festate;
 }
@@ -2229,6 +2274,14 @@ odbcIterateForeignScan(ForeignScanState *node)
 					         errmsg("odbc_fdw: field value exceeds max_field_size of " INT64_FORMAT " bytes",
 					                festate->options.max_field_size),
 					         errhint("Raise or remove the \"max_field_size\" option on the foreign table or server.")));
+				/*
+				 * And the same for the scan total, for the same reason: bound
+				 * memory while this field is still being assembled rather than
+				 * once it exists. result_bytes covers the fields already
+				 * completed, used_buffer_size this one so far.
+				 */
+				check_result_size(festate->options.max_result_size,
+				                  festate->result_bytes, used_buffer_size);
 				resize_buffer(&buffer, &buffer_size, used_buffer_size,
 				              checked_buffer_extent(used_buffer_size, chunk_size));
 				ret = SQLGetData(stmt, i, target_type, buffer + used_buffer_size, chunk_size, &result_size);
@@ -2401,6 +2454,22 @@ odbcIterateForeignScan(ForeignScanState *node)
 				                used_buffer_size, festate->options.max_field_size),
 				         errhint("Raise or remove the \"max_field_size\" option on the foreign table or server.")));
 
+			/*
+			 * The exact max_result_size test, on this field's real length, then
+			 * charge it to the scan. Checked BEFORE adding so that the running
+			 * total never exceeds the ceiling, which is the invariant
+			 * check_result_size' subtraction relies on to be overflow-free.
+			 *
+			 * used_buffer_size is what this extension retrieved into its own
+			 * buffer. It is not the tuple's footprint: a BIN_CONVERSION column
+			 * is hex-encoded to twice this, and the StringInfo and the heap
+			 * tuple are further copies. So this ceiling bounds the retrieval,
+			 * and the backend's actual high-water mark is a multiple of it.
+			 */
+			check_result_size(festate->options.max_result_size,
+			                  festate->result_bytes, used_buffer_size);
+			festate->result_bytes += (int64) used_buffer_size;
+
 			if (ret != SQL_SUCCESS_WITH_INFO)
 			{
 				// TODO: review check_result behaviour for SQL_SUCCESS_WITH_INFO (it should not fail right?)
@@ -2561,6 +2630,7 @@ odbcReScanForeignScan(ForeignScanState *node)
 
 	/* The ceilings are per scan, so their counters restart with the scan. */
 	festate->row_count = 0;
+	festate->result_bytes = 0;
 }
 
 

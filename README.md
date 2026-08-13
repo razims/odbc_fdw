@@ -112,7 +112,8 @@ The HANA probe is opt-in and never runs as part of the normal Docker build or
 smoke test. Copy `.env.example` to `.env`, add the tenant's read-only probe
 details and expected single sample value, and place SAP's driver libraries in
 the gitignored `.hana-driver/` directory. Neither location is committed or
-included in the Docker image.
+included in the Docker image. Use the Linux libraries that match Docker's
+platform, including `libSQLDBCHDB.so` when it is required by the tested client.
 
 ```sh
 cp .env.example .env
@@ -240,20 +241,29 @@ by the time it arrives, so nothing here can recover what was meant.
 
 ## Our options: resource ceilings
 
-Two of them, both intended for a shared warehouse where a foreign table points
+Three of them, all intended for a shared warehouse where a foreign table points
 at somebody else's production database:
 
 | option | unit | default | refuses |
 | --- | --- | --- | --- |
 | `max_field_size` | bytes | `0` (unlimited) | any single field value larger than this |
 | `max_row_count` | rows | `0` (unlimited) | a scan returning more rows than this |
+| `max_result_size` | bytes | `0` (unlimited) | a scan retrieving more than this in total |
 
 ```sql
 CREATE SERVER src FOREIGN DATA WRAPPER odbc_fdw OPTIONS (
   odbc_driver 'HDBODBC', odbc_servernode 'host:30015',
-  max_field_size '1048576',    -- 1 MiB
-  max_row_count  '10000000');
+  max_field_size  '1048576',      -- 1 MiB in any one value
+  max_row_count   '10000000',
+  max_result_size '2147483648');  -- 2 GiB across the whole scan
 ```
+
+`max_result_size` exists because the other two do not compose into a bound on
+the whole result: 200 columns of 1KB across 10,000,000 rows violates neither.
+It is the ceiling on the product. Measured — a scan with `max_field_size 1000`
+and `max_row_count 5000` both satisfied still retrieved 221,786 bytes; the same
+scan with `max_result_size 50000` is refused at 50,054, and the error names the
+running total.
 
 Rules that apply to every one of them, and to any added later:
 
@@ -274,6 +284,12 @@ Rules that apply to every one of them, and to any added later:
 - **They refuse rather than truncating.** Returning the first N rows of a
   larger result, or a shortened field, is a wrong answer, which is worse than
   no answer.
+- **Per scan, not per query, session or transaction.** A query reading two
+  foreign tables gets a fresh count for each, and a plan that rescans a foreign
+  table — a correlated subquery, a nested loop — restarts the counters on each
+  rescan. That is deliberate: a ceiling is a statement about how much one scan
+  may return, and how many times a scan happens is the planner's choice rather
+  than the operator's.
 
 **What they do not do.** The ODBC driver runs **inside the PostgreSQL backend**.
 A fault in the driver is a `SIGSEGV`, and PostgreSQL's response to a backend
@@ -283,6 +299,21 @@ failed query. No option here changes that; only a process boundary would. These
 ceilings bound what a runaway *remote* can make **this extension** allocate,
 which makes such a remote survivable. They are not isolation and must not be
 described as if they were.
+
+Four more things they specifically do not bound, because a ceiling that reads as
+protection it does not give is worse than none:
+
+- **the backend's real memory high-water mark.** They count the bytes this
+  extension retrieves into its own field buffer. A binary column is then
+  hex-encoded to twice that, and the `StringInfo` and the heap tuple are further
+  copies, so the footprint is a multiple of what is counted, not equal to it.
+- **anything above the scan.** A sort, hash or tuplestore built from these rows
+  is bounded by `work_mem`, not by these options.
+- **time, or the number of round trips.** A scan can sit inside every ceiling and
+  still take hours. `statement_timeout` is the tool for that, and it cannot
+  interrupt a blocked driver call either — see fix 6 below.
+- **the metadata paths.** `IMPORT FOREIGN SCHEMA`, `ODBCTablesList`,
+  `ODBCTableSize` and `ODBCQuerySize` do their own reads and are not counted.
 
 ---
 

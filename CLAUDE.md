@@ -21,10 +21,9 @@ authority on behaviour; this file is for whoever is *changing* the code.
 
 ## Keep the documentation current
 
-`README.md`, `NEWS.md` and this file are living documents. There is no test
-suite that can run on a workstation (see Testing), so prose is a larger share of
-the safety net here than it would be in an ordinary repository — a stale claim
-gets trusted.
+`README.md`, `NEWS.md` and this file are living documents. Docker is the only
+supported development environment (see Testing), so the build and test commands
+are a real safety boundary rather than examples to translate for each host.
 
 | Changed | Also update |
 | --- | --- |
@@ -103,7 +102,22 @@ single chunk never reaches it. The check after the loop is the exact one, on the
 value's real length. Measured both arms: a 12000-byte value against a ceiling of
 5000 is caught mid-assembly (the message carries no length), a 100-byte value
 against a ceiling of 10 is caught by the exact test (the message carries `100
-bytes`).
+bytes`). `max_result_size` is enforced from the same two places, for the same
+reason, through one function so the predicate exists once.
+
+**`check_result_size` compares by SUBTRACTION, and that is not a style
+choice.** `max_result_size` is any non-negative `int64` an operator cares to
+type, so `done_bytes + field_bytes > max` is the side of the inequality that can
+overflow. The function maintains `done_bytes <= max_result_size` — the check runs
+*before* the running total is charged — which makes `max - done` non-negative and
+the comparison total. Charge after checking, never before.
+
+**A ceiling is per SCAN, and `ReScanForeignScan` restarts its counters.** Not per
+query, session or transaction. A rescan is the planner's choice, not the
+operator's, so counting cumulatively across rescans would make whether a query
+succeeds depend on whether a `Memoize` node was costed in. Measured: a ceiling of
+exactly 2000 rows against a 2000-row remote succeeds on all three rescans of a
+correlated subquery, and 1999 raises on each.
 
 **There is deliberately NO `CHECK_FOR_INTERRUPTS()` at the row boundary in
 `odbcIterateForeignScan`, and a comment in the source says so.** This is a
@@ -249,6 +263,23 @@ or `pg_config.h` and the pgxs makefiles are simply absent.
 a new warning is a defect in the new code.
 
 ## Testing
+
+**Use Docker for all builds and tests.** `make docker-build` builds the fixed
+PostgreSQL 18 tool image, `make docker-shell` opens it with the checkout mounted,
+and `make docker-test` runs the credential-free psqlODBC smoke test. The smoke
+test compiles and installs the extension, starts a disposable PostgreSQL
+instance, connects back into it through a real ODBC driver, checks a scan and
+import, validates a rejected ceiling, verifies both ceilings reject, and carries
+a missing-symbol negative control. It is the ordinary development gate.
+
+**The HANA probe is opt-in and its configuration is local only.** `.env.example`
+is the committed template; `.env` is gitignored and holds the tenant hostname,
+credentials, expected row count and known sample value. SAP driver libraries go
+only in the gitignored `.hana-driver/` directory and are mounted read-only for
+`make docker-hana`; do not add either to an image, commit, log, issue or commit
+message. The probe verifies its configured schema+table and sample value, not
+all HANA behaviour. A new observed defect still belongs in README and a commit
+body.
 
 **`test/` is upstream's harness and it needs a LIVE ODBC source** — MySQL, SQL
 Server, Hive or PostgreSQL registered in `odbcinst.ini`, with fixtures loaded
