@@ -162,6 +162,15 @@ typedef struct odbcFdwExecutionState
 	StringInfoData  *table_columns;
 	bool            first_iteration;
 	int64           row_count;   /* rows returned so far, for max_row_count */
+	/*
+	 * The remote query text, kept so that ReScanForeignScan can re-execute it.
+	 * It is the StringInfo odbcBeginForeignScan built, which was allocated in
+	 * the same memory context as this struct and therefore has the same
+	 * lifetime; no copy is needed. Safe to re-execute verbatim because nothing
+	 * in it varies per rescan -- odbcGetQual pushes down only Var = Const, so
+	 * a parameterised qual is never baked into this string.
+	 */
+	char            *query;
 	List            *col_position_mask;
 	List            *col_size_array;
 	List            *col_conversion_array;
@@ -1919,6 +1928,7 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->encoding = encoding;
 	/* festate comes from palloc, not palloc0, so this must be set explicitly */
 	festate->row_count = 0;
+	festate->query = sql.data;
 	node->fdw_state = (void *) festate;
 }
 
@@ -2510,7 +2520,47 @@ odbcEndForeignScan(ForeignScanState *node)
 static void
 odbcReScanForeignScan(ForeignScanState *node)
 {
+	odbcFdwExecutionState *festate = (odbcFdwExecutionState *) node->fdw_state;
+	SQLRETURN ret;
+
 	elog_debug("%s", __func__);
+
+	/*
+	 * Actually rescan. This was an empty function, and an empty ReScan is not a
+	 * cheap no-op here: the executor's contract is that after this call the scan
+	 * starts again from the first row, and nothing else repositions an ODBC
+	 * cursor. The cursor was left wherever the previous scan finished --
+	 * normally exhausted -- so the second and every later scan returned NO ROWS
+	 * and the query got a wrong answer with no error anywhere.
+	 *
+	 * SQLFreeStmt with SQL_CLOSE rather than SQLCloseCursor, and the difference
+	 * matters: SQLCloseCursor returns SQL_ERROR with SQLSTATE 24000 when no
+	 * cursor is open, which is a perfectly ordinary state here (a scan whose
+	 * result set the executor never opened, or which the driver closed on
+	 * exhaustion), so it would either have to be called and its return ignored
+	 * -- indistinguishable from a real failure -- or guarded by state this
+	 * function does not have. SQL_CLOSE is documented as having no effect when
+	 * no cursor is open, and leaves the statement allocated and executable.
+	 *
+	 * Re-executing the stored text is correct because nothing in it varies per
+	 * rescan: odbcGetQual pushes down only `Var = Const` with a text constant
+	 * and TEXTEQ, so a Param never reaches the remote query, and a correlated
+	 * qual stays a LOCAL filter on the scan node. If a future change pushes a
+	 * parameter down, this function must rebuild the query instead of replaying
+	 * it, and that is the note to find here.
+	 *
+	 * first_iteration is deliberately NOT reset. The masks it computes describe
+	 * the mapping between the result set and the foreign table, the re-executed
+	 * statement is the same statement, so its result metadata is identical and
+	 * the masks stay valid. Resetting would recompute them into
+	 * es_query_cxt on every rescan, which leaks for the life of the query.
+	 */
+	SQLFreeStmt(festate->stmt, SQL_CLOSE);
+	ret = SQLExecDirect(festate->stmt, (SQLCHAR *) festate->query, SQL_NTS);
+	check_return(ret, "Re-executing ODBC query", festate->stmt, SQL_HANDLE_STMT);
+
+	/* The ceilings are per scan, so their counters restart with the scan. */
+	festate->row_count = 0;
 }
 
 
