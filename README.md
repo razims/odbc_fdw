@@ -42,7 +42,7 @@ Softinent` is added *beside* those notices in the files we substantially
 modify, never in place of them. That is the licence's one condition, and it is
 not a formality — do not "tidy" any of it away.
 
-The four defect fixes and the zero-column import refusal are candidates for
+The five defect fixes and the zero-column import refusal are candidates for
 upstreaming, and we intend to offer them. They are not offered yet, and nothing
 here waits on that: issues are disabled on `devrimgunduz/odbc_fdw`, so a pull
 request is the only channel there, and these fixes are load-bearing for a
@@ -86,6 +86,47 @@ Then, per database:
 ```sql
 CREATE EXTENSION odbc_fdw;
 ```
+
+### Docker-only development
+
+Docker is the supported development environment. It fixes the PostgreSQL major,
+compiler, PGXS headers and unixODBC versions at the same values used for the
+release target; no host PostgreSQL installation is needed.
+
+```sh
+make docker-build  # build the PostgreSQL 18 development image
+make docker-shell  # open a shell with this checkout mounted at /workspace
+make docker-test   # compile, install and run the credential-free ODBC smoke test
+```
+
+`docker-test` starts a disposable PostgreSQL 18 instance and reaches a second
+database in that instance through Debian's psqlODBC driver. It proves the built
+library loads, the validator rejects invalid ceilings, schema import works, a
+scan returns the expected values, and both resource ceilings refuse at their
+boundaries. It also has a deliberately-invalid C symbol control, so success of
+`CREATE EXTENSION` is evidence that symbol resolution was actually checked.
+
+### Optional HANA 2.0 probe
+
+The HANA probe is opt-in and never runs as part of the normal Docker build or
+smoke test. Copy `.env.example` to `.env`, add the tenant's read-only probe
+details and expected single sample value, and place SAP's driver libraries in
+the gitignored `.hana-driver/` directory. Neither location is committed or
+included in the Docker image.
+
+```sh
+cp .env.example .env
+# Edit .env locally, copy SAP libraries to .hana-driver/, then:
+make docker-hana
+```
+
+The probe creates a disposable local PostgreSQL instance, registers the mounted
+driver only for that process, imports the configured HANA schema/table, and
+checks the imported row count and named sample column against `.env`. It prints
+only a pass/fail result, not the connection string, password or returned value.
+A successful probe establishes the configured schema+table and value-binding
+paths against that tenant; it does not claim that every HANA type or driver
+option is covered.
 
 ---
 
@@ -290,16 +331,26 @@ wrapper, not quirks of one driver. The commit messages carry the measurements;
    with a bare "Reading data" error because `SQL_NO_DATA` carries no diagnostic
    record.
 
+5. **`ReScanForeignScan` did nothing, so a rescanned foreign table returned no
+   rows.** The callback's contract is that the scan restarts from its first row,
+   and nothing else repositions an ODBC cursor — so the second and every later
+   scan of the same node came back empty. Measured with a correlated subquery
+   over three local rows: the first returned its value and the other two
+   returned NULL, with no error, no warning and no notice. It hides behind a
+   `Materialize` or `Memoize` node whenever the planner inserts one, so whether
+   a query was wrong depended on a cost estimate. Now the statement is
+   re-executed and the ceiling counters restart with the scan.
+
 Plus, beyond the defects:
 
-5. **A large single field is cancellable.** `CHECK_FOR_INTERRUPTS()` inside the
+6. **A large single field is cancellable.** `CHECK_FOR_INTERRUPTS()` inside the
    chunked read, which is the one part of a scan PostgreSQL's own per-tuple
    check cannot reach. There is deliberately **no** check at the row boundary,
    and a comment in the source says so: `ExecScan` already checks once per
    tuple, measured three ways. This bounds the loop, not the driver — a driver
    blocking inside one `SQLGetData` still cannot be interrupted.
 
-6. **The retrieval path is bounds-checked**, so a wrong length from a driver
+7. **The retrieval path is bounds-checked**, so a wrong length from a driver
    raises rather than corrupting memory: a negative buffer extent, a
    non-positive `BufferLength` passed to `SQLGetData`, impossible
    `resize_buffer` geometry, a 64-bit driver total truncating through `(int)`,
@@ -308,7 +359,7 @@ Plus, beyond the defects:
    means the arithmetic is wrong, and reading a different amount than the driver
    was asked for would convert a detectable fault into a wrong answer.
 
-7. **`IMPORT FOREIGN SCHEMA` refuses to create a zero-column foreign table.**
+8. **`IMPORT FOREIGN SCHEMA` refuses to create a zero-column foreign table.**
    `CREATE FOREIGN TABLE x () SERVER s` is something PostgreSQL accepts quite
    happily, so an import could report success and leave an object that fails
    only later, in somebody else's query, with an error about the remote rather
