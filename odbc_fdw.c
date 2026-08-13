@@ -1892,7 +1892,30 @@ odbcIterateForeignScan(ForeignScanState *node)
 	if (SQL_SUCCEEDED(ret))
 	{
 		SQLSMALLINT i;
-		values = (char **) palloc(sizeof(char *) * columns);
+		/*
+		 * One slot per FOREIGN TABLE column, and ZEROED.
+		 *
+		 * Was palloc(sizeof(char *) * columns), which is wrong twice over.
+		 * It was sized by the number of RESULT columns while every write
+		 * below indexes it by mapped_pos, a position in the FOREIGN TABLE,
+		 * and BuildTupleFromCStrings reads natts entries regardless -- so a
+		 * table with more columns than the query returns overran the
+		 * allocation. And palloc does not zero, while a result column that
+		 * matches no table column is `continue`d over, leaving that slot
+		 * uninitialised for BuildTupleFromCStrings to dereference as a C
+		 * string.
+		 *
+		 * That single read of uninitialised heap is the entire measured
+		 * symptom set against HANA: 'ABCDEFGH' arriving empty, SYS.TABLES
+		 * schema names arriving as a stray \x03 and as blanks with the row
+		 * COUNT still correct, 424242 failing with "invalid input syntax for
+		 * integer", and an intermittent SIGSEGV that took the whole instance
+		 * into crash recovery and appeared to depend on which HANA client
+		 * libraries were installed -- because that changed the heap layout,
+		 * not the bug. A zeroed slot is a SQL NULL, which is the honest
+		 * answer for a column the remote query did not return.
+		 */
+		values = (char **) palloc0(sizeof(char *) * num_of_table_cols);
 
 		/* Loop through the columns */
 		for (i = 1; i <= columns; i++)
