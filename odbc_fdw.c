@@ -3,6 +3,7 @@
  *        foreign-data wrapper for ODBC
  *
  * Copyright (c) 2011, PostgreSQL Global Development Group
+ * Copyright (c) 2026, Softinent
  *
  * This software is released under the PostgreSQL Licence.
  *
