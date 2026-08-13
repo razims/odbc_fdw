@@ -132,6 +132,18 @@ typedef struct odbcFdwOptions
 	char  *sql_count;  /* SQL query for counting results */
 	char  *encoding;   /* Character encoding name */
 
+	/*
+	 * Resource ceilings. 0 means unlimited, which is the default, so a server
+	 * or table that sets neither behaves exactly as before.
+	 *
+	 * These are NOT named with an odbc_ prefix on purpose: any option so
+	 * prefixed is passed straight through to the ODBC connection string as a
+	 * driver attribute (see is_odbc_attribute), so an odbc_-prefixed name here
+	 * would be handed to the driver instead of being read by this extension.
+	 */
+	int64 max_field_size; /* refuse a single field value larger than this, bytes */
+	int64 max_row_count;  /* refuse a scan that returns more rows than this */
+
 	List *connection_list; /* ODBC connection attributes */
 
 	List  *mapping_list; /* Column name mapping */
@@ -148,6 +160,7 @@ typedef struct odbcFdwExecutionState
 	int             num_of_table_cols;
 	StringInfoData  *table_columns;
 	bool            first_iteration;
+	int64           row_count;   /* rows returned so far, for max_row_count */
 	List            *col_position_mask;
 	List            *col_size_array;
 	List            *col_conversion_array;
@@ -183,6 +196,18 @@ static struct odbcFdwOption valid_options[] =
 	{ "prefix",     ForeignTableRelationId },
 	{ "sql_query",  ForeignTableRelationId },
 	{ "sql_count",  ForeignTableRelationId },
+
+	/*
+	 * Resource ceilings, valid on a server and on a table. Listed for both
+	 * contexts so the errhint the validator builds names them in both, and so
+	 * extract_odbcFdwOptions can claim them before the column-mapping
+	 * fallthrough -- a table option this table did not list would otherwise be
+	 * taken for the name of a remote column.
+	 */
+	{ "max_field_size", ForeignServerRelationId },
+	{ "max_field_size", ForeignTableRelationId },
+	{ "max_row_count",  ForeignServerRelationId },
+	{ "max_row_count",  ForeignTableRelationId },
 
 	/* Sentinel */
 	{ NULL,       InvalidOid}
@@ -511,6 +536,43 @@ get_odbc_attribute_name(const char* defname)
 	return normalized_attribute(defname + offset);
 }
 
+/*
+ * Read a resource ceiling and fold it into whatever ceiling is already in
+ * force, TIGHTEST WINS.
+ *
+ * Deliberately not last-wins, which is what odbcGetOptions' list order would
+ * otherwise give. That order is table options, then server options, then user
+ * mapping options, so the last assignment is the SERVER's -- meaning a plain
+ * assignment here would let a server value override a table value, or, with the
+ * lists in any other order, let a table raise a ceiling an operator set on the
+ * server. For a limit whose purpose is to bound a pathological remote, neither
+ * is acceptable: a ceiling that can be raised from the object it constrains is
+ * not a ceiling. Folding to the minimum also makes the result independent of
+ * that order, so it cannot change if upstream reorders the concatenation.
+ *
+ * 0 means unlimited and therefore loses to any positive value; it can never
+ * loosen a ceiling already set.
+ */
+static void
+apply_limit_option(DefElem *def, int64 *limit)
+{
+	char   *value = defGetString(def);
+	char   *endptr;
+	int64   parsed;
+
+	errno = 0;
+	parsed = strtoll(value, &endptr, 10);
+	if (errno != 0 || endptr == value || *endptr != '\0' || parsed < 0)
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
+		         errmsg("option \"%s\" requires a non-negative integer, got \"%s\"",
+		                def->defname, value),
+		         errhint("0 means unlimited, which is the default.")));
+
+	if (parsed > 0 && (*limit == 0 || parsed < *limit))
+		*limit = parsed;
+}
+
 static void
 extract_odbcFdwOptions(List *options_list, odbcFdwOptions *extracted_options)
 {
@@ -570,6 +632,18 @@ extract_odbcFdwOptions(List *options_list, odbcFdwOptions *extracted_options)
 		if (strcmp(def->defname, "encoding") == 0)
 		{
 			extracted_options->encoding = defGetString(def);
+			continue;
+		}
+
+		if (strcmp(def->defname, "max_field_size") == 0)
+		{
+			apply_limit_option(def, &extracted_options->max_field_size);
+			continue;
+		}
+
+		if (strcmp(def->defname, "max_row_count") == 0)
+		{
+			apply_limit_option(def, &extracted_options->max_row_count);
 			continue;
 		}
 
@@ -710,6 +784,28 @@ odbc_fdw_validator(PG_FUNCTION_ARGS)
 			        (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 			         errmsg("only superusers can set the \"%s\" option of an odbc_fdw server",
 			                def->defname)));
+		}
+
+		/*
+		 * Validate the VALUE of a resource ceiling here, at DDL time.
+		 *
+		 * The rest of this validator checks option NAMES only, and the ceilings
+		 * are otherwise parsed in extract_odbcFdwOptions, which runs when a
+		 * scan starts. That was measured to accept `max_row_count 'lots'`,
+		 * `max_field_size '-1'` and `max_field_size '100MB'` at CREATE FOREIGN
+		 * TABLE and CREATE SERVER, deferring the complaint to the first query --
+		 * so the DDL that contained the mistake reported success and something
+		 * unrelated failed later. A ceiling nobody can tell they set wrongly is
+		 * worse than no ceiling.
+		 *
+		 * The sink is per option and discarded: only the parse and the range
+		 * matter here, not the tightest-wins folding that extraction performs.
+		 */
+		if (strcmp(def->defname, "max_field_size") == 0 ||
+		    strcmp(def->defname, "max_row_count") == 0)
+		{
+			int64 sink = 0;
+			apply_limit_option(def, &sink);
 		}
 
 		/* TODO: detect redundant connection attributes and missing required attributs (dsn or driver)
@@ -1820,6 +1916,8 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	/* prepare for the first iteration, there will be some precalculation needed in the first iteration*/
 	festate->first_iteration = true;
 	festate->encoding = encoding;
+	/* festate comes from palloc, not palloc0, so this must be set explicitly */
+	festate->row_count = 0;
 	node->fdw_state = (void *) festate;
 }
 
@@ -1991,6 +2089,25 @@ odbcIterateForeignScan(ForeignScanState *node)
 	if (SQL_SUCCEEDED(ret))
 	{
 		SQLSMALLINT i;
+
+		/*
+		 * Enforce max_row_count before doing any work for this row.
+		 *
+		 * A remote that returns far more rows than expected is otherwise
+		 * bounded only by the executor's willingness to keep asking, and every
+		 * row costs a palloc'd values[] array and one buffer per column. This
+		 * refuses rather than stopping quietly: silently returning the first N
+		 * rows of a larger result would be a wrong answer, which is worse than
+		 * no answer.
+		 */
+		festate->row_count++;
+		if (festate->options.max_row_count > 0 &&
+		    festate->row_count > festate->options.max_row_count)
+			ereport(ERROR,
+			        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			         errmsg("odbc_fdw: scan returned more than " INT64_FORMAT " rows",
+			                festate->options.max_row_count),
+			         errhint("Raise or remove the \"max_row_count\" option on the foreign table or server.")));
 		/*
 		 * One slot per FOREIGN TABLE column, and ZEROED.
 		 *
@@ -2086,6 +2203,21 @@ odbcIterateForeignScan(ForeignScanState *node)
 				 * stops early rather than one that stops promptly.
 				 */
 				CHECK_FOR_INTERRUPTS();
+				/*
+				 * Enforce max_field_size before growing the buffer again, so a
+				 * runaway value is refused while it is still bounded by the
+				 * ceiling plus one chunk rather than after the whole thing has
+				 * been assembled in memory. used_buffer_size is 0 on the first
+				 * pass, so a value that arrives in a single chunk is never
+				 * rejected here -- the exact test is after the loop.
+				 */
+				if (festate->options.max_field_size > 0 &&
+				    (int64) used_buffer_size > festate->options.max_field_size)
+					ereport(ERROR,
+					        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					         errmsg("odbc_fdw: field value exceeds max_field_size of " INT64_FORMAT " bytes",
+					                festate->options.max_field_size),
+					         errhint("Raise or remove the \"max_field_size\" option on the foreign table or server.")));
 				resize_buffer(&buffer, &buffer_size, used_buffer_size,
 				              checked_buffer_extent(used_buffer_size, chunk_size));
 				ret = SQLGetData(stmt, i, target_type, buffer + used_buffer_size, chunk_size, &result_size);
@@ -2241,6 +2373,22 @@ odbcIterateForeignScan(ForeignScanState *node)
 			{
 				used_buffer_size = strnlen(buffer, used_buffer_size);
 			}
+
+			/*
+			 * The exact max_field_size test, on the value's real length. The
+			 * in-loop check above bounds MEMORY while the value is still being
+			 * assembled, but it cannot be exact: it runs before each chunk, so
+			 * a value delivered in one chunk never reaches it. Both are needed
+			 * -- without this one a max_field_size smaller than a single chunk
+			 * would not be enforced at all.
+			 */
+			if (festate->options.max_field_size > 0 &&
+			    (int64) used_buffer_size > festate->options.max_field_size)
+				ereport(ERROR,
+				        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				         errmsg("odbc_fdw: field value of %d bytes exceeds max_field_size of " INT64_FORMAT,
+				                used_buffer_size, festate->options.max_field_size),
+				         errhint("Raise or remove the \"max_field_size\" option on the foreign table or server.")));
 
 			if (ret != SQL_SUCCESS_WITH_INFO)
 			{
