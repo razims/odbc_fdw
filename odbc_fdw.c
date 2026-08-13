@@ -2840,6 +2840,94 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			}
 			SQLCloseCursor(columns_stmt);
 			SQLFreeHandle(SQL_HANDLE_STMT, columns_stmt);
+
+			/*
+			 * Refuse a table the remote could not describe, instead of
+			 * importing a foreign table with NO COLUMNS.
+			 *
+			 * `i` counts the columns actually emitted above. Zero of them
+			 * produced `CREATE FOREIGN TABLE "local"."name" () SERVER ...`,
+			 * which PostgreSQL accepts quite happily -- so IMPORT FOREIGN
+			 * SCHEMA reported success and left behind an object that can only
+			 * ever fail, at some later moment, in somebody else's query.
+			 *
+			 * The case this exists for is IMPORT FOREIGN SCHEMA ... LIMIT TO.
+			 * Those names are NOT checked against the remote: unlike the
+			 * enumerated and EXCEPT paths, which build their list from
+			 * SQLTables, LIMIT TO takes the names verbatim from the parsed
+			 * statement and trusts them. PostgreSQL has already folded any
+			 * unquoted identifier to lower case by then, so against a remote
+			 * that folds UP -- SAP HANA, Oracle, DB2 -- or one with genuinely
+			 * mixed-case names,
+			 *   IMPORT FOREIGN SCHEMA "S" LIMIT TO (MixedTbl) ...
+			 * asks for "mixedtbl", which does not exist there. Measured: the
+			 * import SUCCEEDED and created a zero-column foreign table whose
+			 * `table` option named a table the remote has never had.
+			 *
+			 * This costs no extra remote work. SQLColumns has already been
+			 * called and has already answered; the answer was simply being
+			 * discarded.
+			 *
+			 * It only DIAGNOSES. The name is folded before this wrapper is
+			 * reached, so nothing here can recover what was meant -- a caller
+			 * that generates IMPORT statements must double-quote the
+			 * identifiers it emits.
+			 */
+			if (i == 0)
+			{
+				if (stmt->list_type == FDW_IMPORT_SCHEMA_LIMIT_TO)
+				{
+					/*
+					 * Only mention identifier folding when folding could
+					 * actually be the cause. PostgreSQL folds an unquoted
+					 * identifier to LOWER case, so a name arriving here with
+					 * any upper-case letter in it was quoted by the caller and
+					 * reached us verbatim -- telling them to quote it would be
+					 * advice they have already taken. An all-lower-case name
+					 * may have been folded or may have been quoted that way,
+					 * and the hint is right either way against a remote that
+					 * folds up.
+					 */
+					const char *p;
+					bool has_upper = false;
+
+					for (p = table_name; *p; p++)
+					{
+						if (*p >= 'A' && *p <= 'Z')
+						{
+							has_upper = true;
+							break;
+						}
+					}
+
+					if (has_upper)
+						ereport(ERROR,
+						        (errcode(ERRCODE_FDW_TABLE_NOT_FOUND),
+						         errmsg("odbc_fdw: remote table \"%s\" was not found, or has no column that can be imported",
+						                table_name),
+						         errdetail("SQLColumns returned no usable column for schema \"%s\", table \"%s\".",
+						                   schema_name ? schema_name : "", table_name),
+						         errhint("The name was quoted, so it reached the remote exactly as written. Check that the table exists in that schema and that the connecting user can see its columns.")));
+					else
+						ereport(ERROR,
+						        (errcode(ERRCODE_FDW_TABLE_NOT_FOUND),
+						         errmsg("odbc_fdw: remote table \"%s\" was not found, or has no column that can be imported",
+						                table_name),
+						         errdetail("SQLColumns returned no usable column for schema \"%s\", table \"%s\".",
+						                   schema_name ? schema_name : "", table_name),
+						         errhint("A LIMIT TO name is parsed by PostgreSQL, which folds an unquoted identifier to LOWER case before this wrapper sees it, so \"%s\" may not be how the remote spells the table. Double-quote the name exactly as the remote spells it.",
+						                 table_name)));
+				}
+				else
+					ereport(ERROR,
+					        (errcode(ERRCODE_FDW_ERROR),
+					         errmsg("odbc_fdw: remote table \"%s\" has no column that can be imported",
+					                table_name),
+					         errdetail("SQLColumns returned no usable column for schema \"%s\", table \"%s\".",
+					                   schema_name ? schema_name : "", table_name),
+					         errhint("The driver enumerated this table, so it exists. Either the connecting user cannot see its columns, or every column has a type this wrapper does not map -- each such column is reported as a NOTICE above. Use EXCEPT to skip it.")));
+			}
+
 			table_columns = lappend(table_columns, (void*)col_str.data);
 		}
 		odbc_disconnection(&env, &dbc);
