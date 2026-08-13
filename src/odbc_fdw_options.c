@@ -105,7 +105,14 @@ static const char *normalized_attribute(const char* attribute_name)
 	size_t i;
 	for (i=0; i < sizeof(normalized_attributes)/sizeof(normalized_attributes[0]); i++)
 	{
-		if (strcasecmp(attribute_name, normalized_attributes[i])==0)
+		/*
+		 * pg_strcasecmp, not strcasecmp: this is an identifier comparison and
+		 * strcasecmp folds case according to LC_CTYPE, which PostgreSQL sets
+		 * from the database. These four names decide whether a connection
+		 * attribute is normalised to the spelling ODBC expects, and two of
+		 * them are UID and PWD.
+		 */
+		if (pg_strcasecmp(attribute_name, normalized_attributes[i])==0)
 		{
 			attribute_name = normalized_attributes[i];
 			break;
@@ -125,8 +132,18 @@ get_odbc_attribute_name(const char* defname)
 	 * by SAP HANA's sessionVariable:<key> connection properties. Keep the
 	 * ordinary odbc_<property> pass-through convention, with this spelling for
 	 * the one useful colon-form property: odbc_sessionvariable_application.
+	 *
+	 * pg_strcasecmp, as in normalized_attribute() below. This is an identifier
+	 * comparison, and strcasecmp folds case according to LC_CTYPE, which
+	 * PostgreSQL sets from the database: a double-quoted
+	 * "odbc_SESSIONVARIABLE_APPLICATION" -- the one spelling that survives
+	 * PostgreSQL's own down-folding with its case intact -- could stop matching
+	 * here under a locale that maps 'I' elsewhere, and an unmatched foreign
+	 * table option is not an error, it becomes a COLUMN NAME MAPPING. A hazard
+	 * rather than a measured defect: no failing case was reproduced. Costs
+	 * nothing to remove.
 	 */
-	if (strcasecmp(attribute_name, "sessionvariable_application") == 0)
+	if (pg_strcasecmp(attribute_name, "sessionvariable_application") == 0)
 		return "sessionVariable:APPLICATION";
 
 	return normalized_attribute(attribute_name);

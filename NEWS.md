@@ -79,10 +79,12 @@ Added:
   than `pg_backend_memory_contexts`, because the ODBC driver allocates inside
   the backend where PostgreSQL's context accounting cannot see it. Measured,
   two identical million-row passes differ by 40,960–65,536 bytes through
-  psqlODBC across runs (allocator granularity, not a trend) and
-  241,664 through SAP's libodbcHDB against a real tenant — a quarter of a byte
-  per row, so that difference is the driver's working set and not a per-row
-  cost. The gate refuses anything above 4MB. Each pass checks `sum(id)` against
+  psqlODBC and 241,664–282,624 bytes through SAP's libodbcHDB against a real
+  tenant. Both are ranges because both move between runs — allocator
+  granularity, not a trend, and quoting either as one exact figure would claim a
+  reproducibility the measurements do not have. Around a quarter of a byte per
+  row, so the difference is the driver's working set and not a per-row cost.
+  The gate refuses anything above 4MB. Each pass checks `sum(id)` against
   `n(n+1)/2` so a short scan cannot pass as a complete one, and the same fixture
   checks the `max_row_count` boundary on both sides and a `statement_timeout`
   part-way through — those two in the loopback harness only; the tenant gate

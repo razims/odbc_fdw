@@ -121,13 +121,15 @@ resident set between the second and third passes — resident set rather than
 `pg_backend_memory_contexts`, because the ODBC driver is loaded into the backend
 and allocates on its own account, so PostgreSQL's context accounting is blind to
 a driver-side leak and `/proc/self/statm` is not. Measured, two identical
-million-row passes differ by **40,960 to 65,536 bytes** through psqlODBC across
-runs — one or two allocator blocks, i.e. flat — and **241,664 bytes** through
-SAP's `libodbcHDB` against a real tenant, a quarter of a byte per row, which is
-that driver's working set rather than anything per-row. The figure is quoted as
-a range because it is allocator granularity and does move between runs; what
-does not move is its order of magnitude. The gate therefore refuses anything
-above 4MB. Each pass also checks `sum(id)` against
+million-row passes differ by **40,960 to 65,536 bytes** through psqlODBC and by
+**241,664 to 282,624 bytes** through SAP's `libodbcHDB` against a real tenant —
+around a quarter of a byte per row, which is that driver's working set rather
+than anything per-row. Both are quoted as ranges because both move between runs:
+these are allocator granularity, not a trend, and quoting either as a single
+exact figure would claim a reproducibility the measurements do not have. What
+does not move is the order of magnitude, so the gate refuses anything above 4MB
+— sixty times the largest reading and still small enough to catch a leak of four
+bytes a row. Each pass also checks `sum(id)` against
 `n(n+1)/2`, so a short scan cannot pass as a complete one; the same fixture then
 checks that `max_row_count` accepts exactly 1,000,000 and refuses 999,999, and
 that a `statement_timeout` part-way through leaves no connection behind.
@@ -146,6 +148,25 @@ Two honest caveats. The smoke test needs no credentials, but **building the
 image needs network access to SAP**, because the development image bakes the HANA
 client described below — there is no offline build. And upstream's `test/`
 regression harness is not part of any of this; see Testing at the end.
+
+If a `make docker-*` target sits for many minutes at
+
+```
+#3 resolve image config for docker-image://docker.io/docker/dockerfile:1.7
+```
+
+that is **not** a slow network, and waiting will not help. It is Docker's
+credential helper: BuildKit fetches the `# syntax=` frontend from Docker Hub,
+that fetch consults `credsStore` from `~/.docker/config.json`, and a wedged
+helper never returns. `docker pull docker/dockerfile:1.7` reproduces it on its
+own, failing with `error getting credentials`. Every image this build needs is
+public, so an empty throwaway config is enough to get past it — `DOCKER_HOST` as
+well, because moving `DOCKER_CONFIG` also loses `currentContext`:
+
+```sh
+mkdir -p /tmp/dockercfg && printf '{}' > /tmp/dockercfg/config.json
+DOCKER_CONFIG=/tmp/dockercfg DOCKER_HOST="unix://$HOME/.docker/run/docker.sock" make docker-hana
+```
 
 ### Optional HANA 2.0 probe
 
