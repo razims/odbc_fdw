@@ -42,7 +42,12 @@ ifdef DEBUG
 override CFLAGS += -DDEBUG -g -O0
 endif
 
-DOCKER_GOALS = docker-build docker-shell docker-test docker-hana docker-hana-seed docker-hana-clean
+DOCKER_GOALS = \
+	docker-build docker-shell docker-test docker-hana docker-hana-seed docker-hana-clean \
+	docker-test-amd64 docker-test-arm64 docker-test-all \
+	docker-hana-amd64 docker-hana-arm64 docker-hana-all \
+	docker-hana-seed-amd64 docker-hana-seed-arm64 \
+	docker-hana-clean-amd64 docker-hana-clean-arm64
 NON_DOCKER_GOALS = $(filter-out $(DOCKER_GOALS),$(MAKECMDGOALS))
 
 # A Docker-only command must be usable on a host with no PostgreSQL headers or
@@ -69,7 +74,12 @@ integration_tests:
 
 DOCKER_COMPOSE ?= docker compose
 
-.PHONY: docker-build docker-shell docker-test docker-hana docker-hana-seed docker-hana-clean
+.PHONY: \
+	docker-build docker-shell docker-test docker-hana docker-hana-seed docker-hana-clean \
+	docker-test-amd64 docker-test-arm64 docker-test-all \
+	docker-hana-amd64 docker-hana-arm64 docker-hana-all \
+	docker-hana-seed-amd64 docker-hana-seed-arm64 \
+	docker-hana-clean-amd64 docker-hana-clean-arm64
 
 # Docker is the supported development environment. The local smoke test needs
 # no credentials; the HANA suite is opt-in and reads the gitignored .env file.
@@ -84,9 +94,32 @@ docker-test:
 	$(DOCKER_COMPOSE) build test
 	$(DOCKER_COMPOSE) run --rm test
 
+# Explicit platforms make the non-native image testable through Docker's
+# emulation support. They are intentionally separate from docker-test, whose
+# native-platform behaviour remains the fast development default.
+docker-test-amd64:
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 $(DOCKER_COMPOSE) build test
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 $(DOCKER_COMPOSE) run --rm test
+
+docker-test-arm64:
+	DOCKER_DEFAULT_PLATFORM=linux/arm64 $(DOCKER_COMPOSE) build test
+	DOCKER_DEFAULT_PLATFORM=linux/arm64 $(DOCKER_COMPOSE) run --rm test
+
+docker-test-all: docker-test-amd64 docker-test-arm64
+
 docker-hana:
 	$(DOCKER_COMPOSE) build hana
 	$(DOCKER_COMPOSE) run --rm hana
+
+docker-hana-amd64:
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 $(DOCKER_COMPOSE) build hana
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 $(DOCKER_COMPOSE) run --rm hana
+
+docker-hana-arm64:
+	DOCKER_DEFAULT_PLATFORM=linux/arm64 $(DOCKER_COMPOSE) build hana
+	DOCKER_DEFAULT_PLATFORM=linux/arm64 $(DOCKER_COMPOSE) run --rm hana
+
+docker-hana-all: docker-hana-amd64 docker-hana-arm64
 
 # This is deliberately separate from docker-hana: it replaces or removes only
 # ODBC_FDW_* fixture tables in HANA_SCHEMA.
@@ -94,6 +127,22 @@ docker-hana-seed:
 	$(DOCKER_COMPOSE) build hana-seed
 	$(DOCKER_COMPOSE) run --rm hana-seed
 
+docker-hana-seed-amd64:
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 $(DOCKER_COMPOSE) build hana-seed
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 $(DOCKER_COMPOSE) run --rm hana-seed
+
+docker-hana-seed-arm64:
+	DOCKER_DEFAULT_PLATFORM=linux/arm64 $(DOCKER_COMPOSE) build hana-seed
+	DOCKER_DEFAULT_PLATFORM=linux/arm64 $(DOCKER_COMPOSE) run --rm hana-seed
+
 docker-hana-clean:
 	$(DOCKER_COMPOSE) build hana-clean
 	$(DOCKER_COMPOSE) run --rm hana-clean
+
+docker-hana-clean-amd64:
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 $(DOCKER_COMPOSE) build hana-clean
+	DOCKER_DEFAULT_PLATFORM=linux/amd64 $(DOCKER_COMPOSE) run --rm hana-clean
+
+docker-hana-clean-arm64:
+	DOCKER_DEFAULT_PLATFORM=linux/arm64 $(DOCKER_COMPOSE) build hana-clean
+	DOCKER_DEFAULT_PLATFORM=linux/arm64 $(DOCKER_COMPOSE) run --rm hana-clean

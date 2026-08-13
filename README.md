@@ -97,6 +97,11 @@ release target; no host PostgreSQL installation is needed.
 make docker-build  # build the PostgreSQL 18 development image
 make docker-shell  # open a shell with this checkout mounted at /workspace
 make docker-test   # compile, install and run the credential-free ODBC smoke test
+# Explicitly test each Linux architecture (Docker Desktop emulates non-native):
+make docker-test-amd64
+make docker-test-arm64
+# Run both sequentially:
+make docker-test-all
 ```
 
 `docker-test` starts a disposable PostgreSQL 18 instance and reaches a second
@@ -110,6 +115,12 @@ raise a ceiling set on its server, and that a rescanned foreign scan restarts.
 It also carries a deliberately-invalid C symbol control, which is what makes the
 success of `CREATE EXTENSION` evidence that symbol resolution was checked rather
 than assumed.
+
+`docker-test-amd64` and `docker-test-arm64` set `DOCKER_DEFAULT_PLATFORM` for
+both the image build and container run. This selects the matching pinned SAP
+HANA client archive even though the smoke test itself uses psqlODBC. Use
+`docker-test-all` for the full two-architecture smoke gate; Docker must have
+the corresponding platform available (Docker Desktop provides emulation).
 
 Two honest caveats. The smoke test needs no credentials, but **building the
 image needs network access to SAP**, because the development image bakes the HANA
@@ -133,6 +144,11 @@ make docker-hana-seed
 make docker-hana
 # Remove just those fixture tables when finished:
 make docker-hana-clean
+# Architecture-specific equivalents are available when validating both images:
+make docker-hana-seed-amd64 && make docker-hana-amd64
+make docker-hana-seed-arm64 && make docker-hana-arm64
+# Run both probes after their fixtures already exist:
+make docker-hana-all
 ```
 
 The seed never creates or drops `HANA_SCHEMA`; it creates, replaces or removes
