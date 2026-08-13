@@ -7,6 +7,7 @@
 \getenv hana_password HANA_PASSWORD
 \getenv hana_encrypt HANA_ENCRYPT
 \getenv hana_schema HANA_SCHEMA
+\getenv hana_test_application HANA_TEST_APPLICATION
 
 CREATE EXTENSION odbc_fdw;
 CREATE SCHEMA probe;
@@ -16,7 +17,8 @@ CREATE SERVER hana FOREIGN DATA WRAPPER odbc_fdw OPTIONS (
     odbc_servernode :'hana_servernode',
     odbc_databasename :'hana_database',
     odbc_encrypt :'hana_encrypt',
-    odbc_sslvalidatecertificate 'false'
+    odbc_sslvalidatecertificate 'false',
+    odbc_sessionvariable_application :'hana_test_application'
 );
 
 CREATE USER MAPPING FOR CURRENT_USER SERVER hana OPTIONS (

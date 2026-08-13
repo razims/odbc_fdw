@@ -112,6 +112,26 @@ a scan returns the expected values, that the validator refuses a malformed
 ceiling at DDL time, that each of the three ceilings refuses at its boundary
 *while the same scan succeeds under the other two*, that a foreign table cannot
 raise a ceiling set on its server, and that a rescanned foreign scan restarts.
+
+It also moves **1,000,000 rows** and watches what that costs. Two-row tests
+establish behaviour and nothing at all about behaviour at size: a leak of a
+hundred bytes per row is invisible at two rows and is 100MB at a million. The
+gate transfers the table three times in one session and compares the backend's
+resident set between the second and third passes — resident set rather than
+`pg_backend_memory_contexts`, because the ODBC driver is loaded into the backend
+and allocates on its own account, so PostgreSQL's context accounting is blind to
+a driver-side leak and `/proc/self/statm` is not. Measured, two identical
+million-row passes differ by **40,960 to 65,536 bytes** through psqlODBC across
+runs — one or two allocator blocks, i.e. flat — and **241,664 bytes** through
+SAP's `libodbcHDB` against a real tenant, a quarter of a byte per row, which is
+that driver's working set rather than anything per-row. The figure is quoted as
+a range because it is allocator granularity and does move between runs; what
+does not move is its order of magnitude. The gate therefore refuses anything
+above 4MB. Each pass also checks `sum(id)` against
+`n(n+1)/2`, so a short scan cannot pass as a complete one; the same fixture then
+checks that `max_row_count` accepts exactly 1,000,000 and refuses 999,999, and
+that a `statement_timeout` part-way through leaves no connection behind.
+
 It also carries a deliberately-invalid C symbol control, which is what makes the
 success of `CREATE EXTENSION` evidence that symbol resolution was checked rather
 than assumed.
@@ -151,9 +171,25 @@ make docker-hana-seed-arm64 && make docker-hana-arm64
 make docker-hana-all
 ```
 
+Setting `HANA_BULK_ROWS` in `.env` adds the million-row transfer described
+above, against the tenant instead of the loopback: the seed then also creates
+`ODBC_FDW_BULK` with that many rows, and the probe pulls it twice, comparing
+resident set between the passes. It is opt-in because the pull crosses the
+network — the probe goes from seconds to minutes — and because a million rows is
+a different thing to leave in somebody's schema than the handful every other
+fixture uses. Left unset, the probe prints the check as **skipped** rather than
+counting it as passed.
+
 The seed never creates or drops `HANA_SCHEMA`; it creates, replaces or removes
-only its `ODBC_FDW_DATA_TYPES`, `ODBC_FDW_LARGE_VALUES` and `ODBC_FDW_SINGLE_ROW`
-tables. Give the configured account rights only on that dedicated test schema.
+only its own fixture tables, and `make docker-hana-clean` removes exactly the
+same set. That set is eight tables — `ODBC_FDW_DATA_TYPES`,
+`ODBC_FDW_LARGE_VALUES`, `ODBC_FDW_SINGLE_ROW`, `ODBC_FDW_TYPE_MATRIX`,
+`ODBC_FDW_ENCODING_MATRIX`, `ODBC_FDW_JSON_VALUES`, and the two whose names
+deliberately do **not** carry the prefix because they are the identifier-folding
+fixtures, `odbc_fdw_lower_table` and `"OdbcFdwMixedTable"` — plus
+`ODBC_FDW_BULK` when `HANA_BULK_ROWS` is set. `seed-hana.sql` is the authority;
+if it and this list ever disagree, the file is right. Give the configured
+account rights only on that dedicated test schema.
 
 The suite creates a disposable local PostgreSQL instance and uses the HDBODBC
 driver registered in the development image. It checks direct case-insensitive
@@ -243,6 +279,7 @@ ceilings refuse credential-shaped names.
 | `dsn` | server | Data Source Name, if you use one |
 | `driver` | server | driver name, if you do not |
 | `encoding` | server, table | remote encoding, named as PostgreSQL names it |
+| `odbc_sessionvariable_application` | server, user mapping, table | SAP HANA `sessionVariable:APPLICATION` connection property; useful for tagging test or monitoring sessions |
 
 Anything else on a foreign table that is not one of ours and not `odbc_`-prefixed
 is taken as a **column name mapping**. That is why an unrecognised table option
@@ -439,20 +476,26 @@ Plus, beyond the defects:
 
 ## Known defects, not fixed here
 
-Written down so they are not rediscovered in production. All three are
-pre-existing behaviour from the lineage, all three were observed while building
-this release, and none is fixed.
+Written down so they are not rediscovered in production. All are pre-existing
+behaviour from the lineage and all were observed while building this release.
+Each one says plainly whether `1.0.0` — the released version, and the only one
+`default_version` reports — still carries it.
 
 1. **A cancelled or failed scan leaks the remote connection.**
-   `odbcEndForeignScan` is the only place the ODBC `env`/`dbc`/`stmt` handles
-   are freed, and the executor does not call it when a scan errors out — so
-   every error raised from inside a scan leaks a driver connection for the life
-   of the backend. Measured: three cancelled scans left three additional
-   sessions open on the remote. This is the one item here with a consequence on
-   **somebody else's server** that nothing on ours reveals, and connection
-   pooling makes it worse, because the backend outlives the client that caused
-   the scan. The fix, if taken, is a transaction or resource-owner callback, the
-   way `postgres_fdw` does it with `pgfdw_xact_callback`.
+   **Fixed on master; still present in `1.0.0`.** The fix is not tagged and
+   `default_version` still reports `1.0.0`, so anything deployed from a released
+   build has this. `odbcEndForeignScan` was the only place the ODBC
+   `env`/`dbc`/`stmt` handles were freed, and the executor does not call it when
+   a scan errors out — so every error raised from inside a scan leaked a driver
+   connection for the life of the backend, and the three resource ceilings are
+   the most reliable way to reach that path, because raising is what they are
+   for. Measured: three cancelled scans left three additional sessions open on
+   the remote, and twenty scans refused by `max_row_count` left twenty. This is
+   the one item here with a consequence on **somebody else's server** that
+   nothing on ours reveals, and connection pooling makes it worse, because the
+   backend outlives the client that caused the scan. Master releases the handles
+   from a transaction and subtransaction callback, the way `postgres_fdw` does
+   with `pgfdw_xact_callback`.
 
 2. **Reading one field is quadratic in its length.** `resize_buffer` allocates
    and `memmove`s the whole accumulated value on *every* chunk, and chunks are
@@ -471,6 +514,34 @@ this release, and none is fixed.
    which is the same class as the defects above; unfixed only because changing a
    type mapping changes existing foreign tables and needs measuring against more
    than one driver.
+
+4. **`EXPLAIN` executes the remote query.** `odbcBeginForeignScan` ignores its
+   `eflags`, so `EXEC_FLAG_EXPLAIN_ONLY` is never honoured: a plain
+   `EXPLAIN SELECT …` connects and runs the entire remote query, and
+   `odbcExplainForeignScan` then opens another connection for its row count — on
+   top of the two the planner already opened for the same estimate, because
+   `GetForeignRelSize` and `EstimateCosts` each count independently. Honouring
+   the flag would remove all of them, at the cost of `EXPLAIN` no longer proving
+   that the remote query parses, which is why it has not simply been done. Read
+   from the source, not separately measured.
+
+5. **`ODBCTablesList()` re-issues `SQLTables` on every row.** The call sits
+   outside the `SRF_IS_FIRSTCALL()` block, so the catalogue query is re-executed
+   before each fetch against a statement that already has an open cursor, and
+   its return code is then overwritten by the next `SQLFetch` and never checked.
+   Neither harness exercises this function and `dwh` does not use it. Read from
+   the source, not measured.
+
+6. **`IMPORT FOREIGN SCHEMA` maps `SQL_FLOAT` to `real`, which can halve its
+   precision.** In ODBC `SQL_REAL` is single precision and `SQL_FLOAT` is
+   implementation-defined precision that drivers normally report for a *double*;
+   `SQL_DOUBLE` already maps to `float8`, so the `SQL_FLOAT` arm is the one that
+   narrows. No driver reached in this release reports `SQL_FLOAT` — SAP HANA
+   reports `SQL_REAL` for `REAL` and `SQL_DOUBLE` for `DOUBLE`, which is why
+   neither harness catches it — so this is read from the source and **not
+   measured**. Not fixed here for the same reason as the binary types above:
+   changing a type mapping changes existing foreign tables, and it needs
+   measuring against a driver that actually emits `SQL_FLOAT`.
 
 ---
 

@@ -22,6 +22,8 @@ done
 
 validate_schema
 
-sed "s/@SCHEMA@/${HANA_SCHEMA}/g" /workspace/test/hana/clean-hana.sql \
+# awk reading ENVIRON rather than sed with the value in argv; see seed-hana.sh.
+awk '{ gsub(/@SCHEMA@/, ENVIRON["HANA_SCHEMA"]); print }' \
+    /workspace/test/hana/clean-hana.sql \
     | hana-exec
 echo 'HANA cleanup: ODBC_FDW_* fixture tables removed'

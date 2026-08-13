@@ -57,7 +57,15 @@ appendOption(StringInfo str, bool first, const char* option_name, const char* op
 List *
 odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 {
-	/* TODO: review memory management in this function; any leaks? */
+	/*
+	 * The old "TODO: review memory management in this function; any leaks?"
+	 * has been answered: yes, three, all of which grew with the size of the
+	 * remote rather than being constant per statement -- a StringInfo per
+	 * column in sql_data_type, a column-name buffer per table, and a table-name
+	 * buffer per excluded table. Those are fixed. What remains is a handful of
+	 * once-per-statement allocations released when this utility statement's
+	 * context goes away, which is the right lifetime for them.
+	 */
 	odbcFdwOptions options;
 
 	List* create_statements = NIL;
@@ -91,6 +99,13 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
 	elog_debug("%s", __func__);
 
+	/*
+	 * Once for the whole import, not once per column: sql_data_type resets this
+	 * rather than initialising it. Both branches below describe columns, and
+	 * they are mutually exclusive, so one initialisation here covers both.
+	 */
+	initStringInfo(&sql_type);
+
 	odbcGetOptions(serverOid, stmt->options, &options);
 
 	schema_name = get_schema_name(&options);
@@ -116,8 +131,8 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
 		odbc_connection(&options, &env, &dbc);
 
-		/* Allocate a statement handle */
-		SQLAllocHandle(SQL_HANDLE_STMT, dbc, &query_stmt);
+		/* Allocate a statement handle. */
+		odbc_allocate_statement(dbc, &query_stmt);
 
 		/* Retrieve a list of rows */
 		ret = SQLExecDirect(query_stmt, (SQLCHAR *) options.sql_query, SQL_NTS);
@@ -179,8 +194,8 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
 			odbc_connection(&options, &env, &dbc);
 
-			/* Allocate a statement handle */
-			SQLAllocHandle(SQL_HANDLE_STMT, dbc, &tables_stmt);
+			/* Allocate a statement handle. */
+			odbc_allocate_statement(dbc, &tables_stmt);
 
 			ret = SQLTables(
 			          tables_stmt,
@@ -213,7 +228,30 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					getdata_ret = SQLGetData(tables_stmt, SQLTABLES_SCHEMA_COLUMN, SQL_C_CHAR, table_schema, MAXIMUM_SCHEMA_NAME_LEN, &indicator);
 					if (SQL_SUCCESS == getdata_ret)
 					{
-						if (!is_blank_string((char*)table_schema) && strcmp((char*)table_schema, schema_name) )
+						/*
+						 * schema_name may be NULL, and strcmp against NULL is a
+						 * SIGSEGV -- which does not stop at this backend:
+						 * HandleChildCrash SIGQUITs every other one and the
+						 * instance replays WAL, so every session in every
+						 * database on the host is taken into crash recovery.
+						 *
+						 * Two ways to arrive here with it NULL. The documented
+						 * one is OPTIONS (schema ''), which the branch near the
+						 * top of this function turns into NULL on purpose, for
+						 * schema-less sources such as Hive -- against a remote
+						 * that DOES report schemas, the first enumerated table
+						 * then crashes the instance. The other is this loop's
+						 * own error handling a few lines below, which sets
+						 * schema_name = NULL when SQLGetData fails for one
+						 * row's schema column; the next iteration reaches this
+						 * comparison with it NULL. A blank schema cannot be
+						 * matched against anything, so treat "we have no schema
+						 * to filter by" as excluding nothing, which is what the
+						 * NULL assignment below already intends.
+						 */
+						if (schema_name != NULL &&
+						    !is_blank_string((char*)table_schema) &&
+						    strcmp((char*)table_schema, schema_name) )
 						{
 							excluded = true;
 						}
@@ -253,6 +291,12 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					{
 						tables = lappend(tables, (void*)TableName);
 					}
+					else
+					{
+						/* Nothing holds an excluded name; it grew with the
+						 * remote's table count. */
+						pfree(TableName);
+					}
 				}
 			}
 
@@ -275,12 +319,18 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		}
 
 		odbc_connection(&options, &env, &dbc);
+		/*
+		 * One buffer for the whole loop. It was allocated per table and never
+		 * freed, so the cost grew with the number of tables imported; every
+		 * column overwrites it anyway, so there was never anything to keep.
+		 */
+		ColumnName = (SQLCHAR *) palloc(sizeof(SQLCHAR) * MAXIMUM_COLUMN_NAME_LEN);
 		foreach(tables_cell, tables)
 		{
 			char *table_name = (char*)lfirst(tables_cell);
 
-			/* Allocate a statement handle */
-			SQLAllocHandle(SQL_HANDLE_STMT, dbc, &columns_stmt);
+			/* Allocate a statement handle. */
+			odbc_allocate_statement(dbc, &columns_stmt);
 
 			ret = SQLColumns(
 			          columns_stmt,
@@ -293,7 +343,6 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
 			i = 0;
 			initStringInfo(&col_str);
-			ColumnName = (SQLCHAR *) palloc(sizeof(SQLCHAR) * MAXIMUM_COLUMN_NAME_LEN);
 			while (SQL_NO_DATA != ret && SQL_SUCCESS_WITH_INFO != ret)
 			{
 				ret = SQLFetch(columns_stmt);

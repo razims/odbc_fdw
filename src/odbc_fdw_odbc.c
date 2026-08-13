@@ -91,6 +91,269 @@ get_schema_name(odbcFdwOptions *options)
 }
 
 /*
+ * ODBC handle lifetime.
+ *
+ * SQLHENV and SQLHDBC are driver-manager allocations, not palloc'd memory, so
+ * nothing PostgreSQL does when a statement, a query context or a transaction
+ * ends releases them. odbcEndForeignScan was the only place they were freed,
+ * and the executor does NOT call it when a scan errors: PortalCleanup skips
+ * ExecutorEnd for a failed portal. So every error raised from inside a scan
+ * abandoned an environment handle, a connection handle and the remote session
+ * behind it for the life of the backend -- and the ceilings this extension
+ * added are the most reliable way to reach that path, because raising is what
+ * they are for. Cancellation and any driver error do it too.
+ *
+ * Measured before this change with the credential-free loopback harness in
+ * docker/run-local-tests.sh: twenty scans refused by max_row_count left twenty
+ * additional client backends on the remote database, counted from inside the
+ * same session while it was still holding them. Connection pooling makes it
+ * worse, because the backend outlives the client whose query caused the scan.
+ *
+ * So every handle pair this extension allocates is recorded here, and the list
+ * is emptied when the transaction that created the entry ends -- however it
+ * ends. Same shape as postgres_fdw's pgfdw_xact_callback, minus the connection
+ * cache: that has connections worth keeping between transactions, and this does
+ * not, because a connection here never outlives its scan.
+ *
+ * The list lives in TopMemoryContext because it has to survive the destruction
+ * of every memory context a scan used, which is precisely the event it exists
+ * to clean up after.
+ *
+ * This bounds OUR handles and the sessions behind them. It is not a process
+ * boundary: the driver still runs inside the backend, and a fault in it is
+ * still a SIGSEGV that takes the whole instance into crash recovery.
+ */
+typedef struct odbcConnEntry
+{
+	SQLHENV  env;
+	SQLHDBC  dbc;
+	SubTransactionId subxid; /* Current subtransaction when claimed */
+	struct odbcConnEntry *next;
+} odbcConnEntry;
+
+static odbcConnEntry *odbc_live_connections = NULL;
+static bool odbc_xact_callback_registered = false;
+static bool odbc_subxact_callback_registered = false;
+
+/*
+ * Free one connection and its environment. NOTHING HERE MAY ereport.
+ *
+ * This runs from odbc_disconnection on the ordinary path and from the
+ * transaction callbacks on the abort path, and an error raised while a
+ * transaction is aborting re-enters AbortTransaction, which is a PANIC that
+ * takes the instance down -- a considerably worse outcome than the leak. A
+ * failed disconnect is not actionable in any case: the handles must be released
+ * either way, and refusing to release them because the remote has already gone
+ * away is exactly the behaviour that leaked them. Return codes are therefore
+ * read and discarded.
+ *
+ * SQLDisconnect frees any statement handles still allocated on the connection,
+ * which is what odbc_tables_list has always relied on.
+ */
+static void
+odbc_release_handles(SQLHENV env, SQLHDBC dbc)
+{
+	if (dbc != SQL_NULL_HANDLE)
+	{
+		(void) SQLDisconnect(dbc);
+		(void) SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+	}
+	/*
+	 * Not nested inside the dbc arm. It used to be, so a connection handle that
+	 * was never allocated orphaned the environment handle that was.
+	 */
+	if (env != SQL_NULL_HANDLE)
+		(void) SQLFreeHandle(SQL_HANDLE_ENV, env);
+}
+
+/*
+ * Release every recorded connection when the top-level transaction ends.
+ */
+static void
+odbc_release_connections(void)
+{
+	odbcConnEntry **link = &odbc_live_connections;
+
+	while (*link != NULL)
+	{
+		odbcConnEntry *entry = *link;
+
+		*link = entry->next;
+		odbc_release_handles(entry->env, entry->dbc);
+		pfree(entry);
+	}
+}
+
+/* Release entries owned by the subtransaction that just aborted. */
+static void
+odbc_release_subxact_connections(SubTransactionId subxid)
+{
+	odbcConnEntry **link = &odbc_live_connections;
+
+	while (*link != NULL)
+	{
+		odbcConnEntry *entry = *link;
+
+		if (entry->subxid == subxid)
+		{
+			*link = entry->next;
+			odbc_release_handles(entry->env, entry->dbc);
+			pfree(entry);
+		}
+		else
+			link = &entry->next;
+	}
+}
+
+static void
+odbc_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PREPARE:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			/*
+			 * On COMMIT the list is normally already empty: PreCommit_Portals
+			 * runs ExecutorEnd -- including for WITH HOLD cursors, which it
+			 * materialises first -- before these callbacks fire, so
+			 * odbcEndForeignScan has already had its chance. That arm is a
+			 * backstop for a path that forgot to disconnect, not the expected
+			 * route. ABORT is the one that matters.
+			 */
+			odbc_release_connections();
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+odbc_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+                      SubTransactionId parentSubid, void *arg)
+{
+	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_PRE_COMMIT_SUB)
+		return;
+
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		/*
+		 * A PL/pgSQL BEGIN ... EXCEPTION block around a scan is an ordinary
+		 * shape, and it aborts a SUBtransaction rather than the transaction --
+		 * so a hook hung only on the transaction would not fire until the outer
+		 * one ended, and a loop of them would hold one remote session per
+		 * iteration until then. Measured with a 100-iteration loop.
+		 */
+		odbc_release_subxact_connections(mySubid);
+	}
+	else
+	{
+		/*
+		 * PRE_COMMIT is deliberately used rather than COMMIT: after commit,
+		 * GetCurrentTransactionNestLevel() already names the parent. Match the
+		 * exact subtransaction ID instead, so a sibling or parent connection
+		 * can never be adopted accidentally.
+		 */
+		odbcConnEntry *entry;
+
+		for (entry = odbc_live_connections; entry != NULL; entry = entry->next)
+		{
+			if (entry->subxid == mySubid)
+				entry->subxid = parentSubid;
+		}
+	}
+}
+
+/*
+ * Claim a slot BEFORE the first handle exists.
+ *
+ * Deliberately not after: SQLDriverConnect is the call that usually fails, and
+ * by the time it is reached both handles are already allocated. Recording them
+ * first means there is no instant at which a handle exists unrecorded, so every
+ * failure below can simply throw and let the callbacks clean up.
+ */
+static odbcConnEntry *
+odbc_claim_connection_slot(void)
+{
+	odbcConnEntry *entry;
+
+	/*
+	 * One flag per registration, each set immediately after its own call.
+	 *
+	 * Not one flag for both: Register*Callback palloc's, so the second can throw
+	 * while the first has already taken effect. A single flag would still be
+	 * false, and the next attempt would register the FIRST callback a second
+	 * time, leaving two copies installed for the life of the backend. Harmless
+	 * as it happens -- the second odbc_release_connections finds an
+	 * already-drained list -- but a flag that claims "registered exactly once"
+	 * should not be able to lie, and there is no way to unregister.
+	 */
+	if (!odbc_xact_callback_registered)
+	{
+		RegisterXactCallback(odbc_xact_callback, NULL);
+		odbc_xact_callback_registered = true;
+	}
+	if (!odbc_subxact_callback_registered)
+	{
+		RegisterSubXactCallback(odbc_subxact_callback, NULL);
+		odbc_subxact_callback_registered = true;
+	}
+
+	entry = (odbcConnEntry *) MemoryContextAlloc(TopMemoryContext,
+	                                             sizeof(odbcConnEntry));
+	entry->env = SQL_NULL_HANDLE;
+	entry->dbc = SQL_NULL_HANDLE;
+	entry->subxid = GetCurrentSubTransactionId();
+	entry->next = odbc_live_connections;
+	odbc_live_connections = entry;
+
+	return entry;
+}
+
+/* Allocate a statement with a useful connection diagnostic on failure. */
+void
+odbc_allocate_statement(SQLHDBC dbc, SQLHSTMT *stmt)
+{
+	SQLRETURN ret;
+
+	*stmt = SQL_NULL_HANDLE;
+	ret = SQLAllocHandle(SQL_HANDLE_STMT, dbc, stmt);
+	check_return(ret, "Allocating ODBC statement handle", dbc, SQL_HANDLE_DBC);
+}
+
+static void
+odbc_forget_entry(odbcConnEntry *target)
+{
+	odbcConnEntry **link = &odbc_live_connections;
+
+	while (*link != NULL)
+	{
+		if (*link == target)
+		{
+			*link = target->next;
+			pfree(target);
+			return;
+		}
+		link = &(*link)->next;
+	}
+}
+
+static odbcConnEntry *
+odbc_find_connection(SQLHENV env, SQLHDBC dbc)
+{
+	odbcConnEntry *entry;
+
+	for (entry = odbc_live_connections; entry != NULL; entry = entry->next)
+	{
+		if (entry->env == env && entry->dbc == dbc)
+			return entry;
+	}
+	return NULL;
+}
+
+/*
  * Establish ODBC connection
  */
 void
@@ -100,20 +363,51 @@ odbc_connection(odbcFdwOptions* options, SQLHENV *env, SQLHDBC *dbc)
 	SQLCHAR OutConnStr[1024];
 	SQLSMALLINT OutConnStrLen;
 	SQLRETURN ret;
+	odbcConnEntry *entry;
 
 	odbcConnStr(&conn_str, options);
 
-	/* Allocate an environment handle */
-	SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, env);
+	*env = SQL_NULL_HANDLE;
+	*dbc = SQL_NULL_HANDLE;
+	entry = odbc_claim_connection_slot();
+
+	/*
+	 * The SQLAllocHandle returns were not checked. A failure left the handle
+	 * variable holding whatever the driver manager did or did not write, and
+	 * every call below was made against it.
+	 */
+	ret = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, env);
+	if (!SQL_SUCCEEDED(ret))
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+		         errmsg("odbc_fdw: could not allocate an ODBC environment handle")));
+	entry->env = *env;
+
 	/* We want ODBC 3 support */
-	SQLSetEnvAttr(*env, SQL_ATTR_ODBC_VERSION, (void *) SQL_OV_ODBC3, 0);
+	ret = SQLSetEnvAttr(*env, SQL_ATTR_ODBC_VERSION, (void *) SQL_OV_ODBC3, 0);
+	check_return(ret, "Setting ODBC environment version", *env, SQL_HANDLE_ENV);
 
 	/* Allocate a connection handle */
-	SQLAllocHandle(SQL_HANDLE_DBC, *env, dbc);
+	ret = SQLAllocHandle(SQL_HANDLE_DBC, *env, dbc);
+	if (!SQL_SUCCEEDED(ret))
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+		         errmsg("odbc_fdw: could not allocate an ODBC connection handle")));
+	entry->dbc = *dbc;
+
 	/* Connect to the DSN */
 	ret = SQLDriverConnect(*dbc, NULL, (SQLCHAR *) conn_str.data, SQL_NTS,
 	                       OutConnStr, 1024, &OutConnStrLen, SQL_DRIVER_COMPLETE);
-	check_return(ret, "Connecting to driver", dbc, SQL_HANDLE_DBC);
+	/*
+	 * `*dbc`, not `dbc`. This passed the ADDRESS of the handle, and SQLHANDLE
+	 * is void * so it compiled silently -- handing the driver manager a stack
+	 * address where it expected a connection handle. The visible effect was
+	 * that every connection failure reported a bare "Connecting to driver"
+	 * with no driver diagnostic attached, because the diagnostic records were
+	 * being read from something that was not the handle. odbc_disconnection
+	 * always got this right on the identical call.
+	 */
+	check_return(ret, "Connecting to driver", *dbc, SQL_HANDLE_DBC);
 	elog_debug("Connection opened");
 }
 
@@ -123,20 +417,32 @@ odbc_connection(odbcFdwOptions* options, SQLHENV *env, SQLHDBC *dbc)
 void
 odbc_disconnection(SQLHENV *env, SQLHDBC *dbc)
 {
-	SQLRETURN ret;
+	odbcConnEntry *entry = odbc_find_connection(*env, *dbc);
 
-	if (*dbc)
+	/*
+	 * Absent from the registry means these handles have ALREADY been released --
+	 * by the transaction callbacks, or by an earlier disconnection -- and what
+	 * the caller still holds is dangling. odbc_connection is the only thing that
+	 * opens a connection and it always registers one, so this is a reliable
+	 * test, and honouring it is what stops a double release from becoming a
+	 * use-after-free inside the driver manager.
+	 *
+	 * The ordering says this should not arise today: AtAbort_Portals runs before
+	 * CallXactCallbacks, so odbcEndForeignScan has either already run or been
+	 * skipped altogether by then. It is guarded rather than asserted because the
+	 * cost of that reasoning being wrong is a corrupted driver heap, which is
+	 * the failure mode this whole change exists to remove.
+	 */
+	if (entry != NULL)
 	{
-		ret = SQLDisconnect(*dbc);
-		check_return(ret, "dbc disconnect", *dbc, SQL_HANDLE_DBC);
-		ret = SQLFreeHandle(SQL_HANDLE_DBC, *dbc);
-		check_return(ret, "dbc free handle", *dbc, SQL_HANDLE_DBC);
-		if (*env)
-		{
-			ret = SQLFreeHandle(SQL_HANDLE_ENV, *env);
-			check_return(ret, "env free handle", *env, SQL_HANDLE_ENV);
-		}
+		odbc_forget_entry(entry);
+		odbc_release_handles(*env, *dbc);
 	}
+
+	/* Clear the caller's copies so a second call is a no-op either way. */
+	*env = SQL_NULL_HANDLE;
+	*dbc = SQL_NULL_HANDLE;
+
 	elog_debug("Connection closed");
 }
 
@@ -238,7 +544,16 @@ getNameQualifierChar(SQLHDBC dbc, StringInfoData *nq_char)
 void
 getQuoteChar(SQLHDBC dbc, StringInfoData *q_char)
 {
-	SQLCHAR quote_char[2];
+	/*
+	 * Zero-initialised, for the same reason getNameQualifierChar above is:
+	 * SQLGetInfo leaves this untouched if it fails, and quote_char[0] is used
+	 * either way. That byte then wraps every schema, table and column name in
+	 * every query sent to the remote, and is handed to
+	 * escape_sql_identifier_part as the character to double -- so a garbage
+	 * value read off the stack does not merely mangle a name, it decides what
+	 * escaping is applied to it.
+	 */
+	SQLCHAR quote_char[2] = {0, 0};
 
 	elog_debug("%s", __func__);
 
@@ -345,8 +660,8 @@ odbcGetTableSize(odbcFdwOptions* options, unsigned int *size)
 
 	odbc_connection(options, &env, &dbc);
 
-	/* Allocate a statement handle */
-	SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+	/* Allocate a statement handle. */
+	odbc_allocate_statement(dbc, &stmt);
 
 	if (is_blank_string(options->sql_count))
 	{
@@ -477,7 +792,14 @@ odbc_table_size(PG_FUNCTION_ARGS)
 	char *serverName = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char *tableName = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	char *defname = "table";
-	unsigned int tableSize;
+	/*
+	 * Initialised, because odbcGetTableSize assigns *size only when both
+	 * SQLExecDirect and SQLGetData succeed -- the SQLFetch between them is not
+	 * checked at all -- so a count query returning no row left this holding
+	 * whatever was on the stack and returned it. The two internal callers in
+	 * odbc_fdw_scan.c have always initialised to 0; these two had not.
+	 */
+	unsigned int tableSize = 0;
 	List *tableOptions = NIL;
 	Node *val = (Node *) makeString(tableName);
 	Oid serverOid;
@@ -502,7 +824,8 @@ odbc_query_size(PG_FUNCTION_ARGS)
 	char *serverName = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char *sqlQuery = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	char *defname = "sql_query";
-	unsigned int querySize;
+	/* Initialised for the reason given in odbc_table_size above. */
+	unsigned int querySize = 0;
 	List *queryOptions = NIL;
 	Node *val = (Node *) makeString(sqlQuery);
 	Oid serverOid;
@@ -581,7 +904,7 @@ Datum odbc_tables_list(PG_FUNCTION_ARGS)
 
 		odbcGetOptions(serverOid, NULL, &options);
 		odbc_connection(&options, &env, &dbc);
-		SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+		odbc_allocate_statement(dbc, &stmt);
 
 		for ( i = 0 ; i < numColumns ; i++ ) {
 			tableResult[i].TargetType = SQL_C_CHAR;

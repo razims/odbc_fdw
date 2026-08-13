@@ -500,8 +500,8 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 		}
 	}
 
-	/* Allocate a statement handle */
-	SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+	/* Allocate a statement handle. */
+	odbc_allocate_statement(dbc, &stmt);
 
 	elog_debug("Executing query: %s", sql.data);
 
@@ -575,6 +575,26 @@ odbcIterateForeignScan(ForeignScanState *node)
 	 */
 	ret = SQLFetch(stmt);
 
+	/*
+	 * A FAILED fetch is not the end of the result set.
+	 *
+	 * This return was not examined at all. The only test applied to it was the
+	 * SQL_SUCCEEDED guard further down, which decides whether to build a tuple
+	 * -- so SQL_ERROR took exactly the same path as SQL_NO_DATA: an empty slot,
+	 * which the executor reads as "this scan is finished". A connection dropped
+	 * mid-scan, or a remote session killed by its administrator, therefore
+	 * produced a SILENTLY TRUNCATED result set: no error anywhere, and the
+	 * query committed whichever rows had arrived before the failure.
+	 *
+	 * SQL_NO_DATA is the legitimate end of the set and carries no diagnostic
+	 * record, so it must NOT go to check_return -- which rejects anything that
+	 * is not SQL_SUCCEEDED and would report a bare "Fetching row" at the end of
+	 * every scan. Everything else is a real failure and gets the driver's own
+	 * diagnostics.
+	 */
+	if (ret != SQL_NO_DATA)
+		check_return(ret, "Fetching row", stmt, SQL_HANDLE_STMT);
+
 	SQLNumResultCols(stmt, &columns);
 
 	/*
@@ -602,6 +622,8 @@ odbcIterateForeignScan(ForeignScanState *node)
 		col_size_array = NIL;
 		col_conversion_array = NIL;
 		num_of_result_cols = columns;
+		/* Once, not once per column: sql_data_type resets rather than inits. */
+		initStringInfo(&sql_type);
 		/* Obtain the column information of the first row. */
 		for (i = 1; i <= columns; i++)
 		{

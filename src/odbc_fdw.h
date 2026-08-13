@@ -30,6 +30,7 @@
 #else
 #include "access/table.h"
 #endif
+#include "access/xact.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
@@ -181,6 +182,7 @@ extern const char *get_odbc_attribute_name(const char *defname);
 /* ODBC connection and SQL helpers. */
 extern void odbc_connection(odbcFdwOptions *options, SQLHENV *env, SQLHDBC *dbc);
 extern void odbc_disconnection(SQLHENV *env, SQLHDBC *dbc);
+extern void odbc_allocate_statement(SQLHDBC dbc, SQLHSTMT *stmt);
 extern void check_return(SQLRETURN ret, char *msg, SQLHANDLE handle, SQLSMALLINT type);
 extern void odbcGetTableSize(odbcFdwOptions *options, unsigned int *size);
 extern void getNameQualifierChar(SQLHDBC dbc, StringInfoData *nq_char);

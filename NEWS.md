@@ -6,6 +6,90 @@ note that those version numbers are git tags of *other* repositories and do
 not line up with any `default_version` this extension ever declared. See
 `README.md` for provenance and for the versioning rule from `1.0.0` on.
 
+## Unreleased
+
+Not tagged, and `default_version` is deliberately still `1.0.0`. The bump
+belongs with the release cut, alongside the matching entry in `dwh`'s
+`ODBC_FDW_DATA_OK` allowlist, so a build can never report a version that `dwh`
+then refuses.
+
+Fixed — resource leaks:
+- **ODBC handles, and the remote sessions behind them, no longer outlive their
+  transaction.** `odbcEndForeignScan` was the only place they were freed, and
+  the executor does not call it for a failed portal — `PortalCleanup` skips
+  `ExecutorEnd` — so every error raised from inside a scan abandoned an
+  environment handle, a connection handle and a remote session for the life of
+  the backend. The ceilings added in `1.0.0` are the most reliable way to reach
+  that path, because raising is what they exist to do. Measured with the
+  credential-free loopback harness: twenty scans refused by `max_row_count` left
+  twenty extra client backends on the remote, and one hundred refused inside
+  PL/pgSQL `EXCEPTION` blocks left ninety-nine. Both are zero now. Released from
+  a transaction callback and a subtransaction callback, the shape `postgres_fdw`
+  uses; the release path cannot `ereport`, because an error raised while a
+  transaction aborts is a PANIC.
+- three allocations in `IMPORT FOREIGN SCHEMA` that grew with the size of the
+  remote rather than being constant per statement: a `StringInfo` per column in
+  `sql_data_type`, a column-name buffer per table, and a table-name buffer per
+  excluded table. A 500-table, 50-column import held roughly 25 MB it did not
+  need.
+- an environment handle was orphaned whenever the connection handle was null,
+  because the free was nested inside the connection's arm.
+
+Fixed — memory safety and wrong answers:
+- **`IMPORT FOREIGN SCHEMA` could dereference NULL and take the whole instance
+  into crash recovery.** `strcmp` was called against a schema name that is NULL
+  both for the documented `OPTIONS (schema '')` configuration and after the
+  function's own error handling sets it so.
+- **a failed `SQLFetch` was indistinguishable from the end of the result set**,
+  so a connection dropped mid-scan produced a silently truncated result with no
+  error anywhere. Only `SQL_NO_DATA` now ends a scan.
+- `getQuoteChar` used an uninitialised stack byte when `SQLGetInfo` wrote
+  nothing — and that byte quotes every identifier sent to the remote and decides
+  what `escape_sql_identifier_part` doubles.
+- `ODBCTableSize` and `ODBCQuerySize` returned uninitialised stack when the
+  count query produced no row.
+- `odbc_connection` passed `check_return` the *address* of the connection handle
+  rather than the handle; `SQLHANDLE` is `void *`, so it compiled silently and
+  every connection failure reported no driver diagnostic at all.
+- environment, connection, and statement `SQLAllocHandle` return codes were
+  not checked.
+
+Added:
+- connection-leak gates in both harnesses. Each counts only the remote sessions
+  created by its own probe run around twenty refused scans and a PL/pgSQL
+  subtransaction loop; both the aborted- and successful-inner-subtransaction
+  paths are covered. The HANA probe identifies its run with HANA's `APPLICATION`
+  session variable and counts the `SYS.M_SESSION_CONTEXT` rows carrying that
+  marker — a session variable surfaces there as a `KEY`/`VALUE` row, and
+  `M_CONNECTIONS` has no client-application column at all, so an earlier draft
+  of this gate selected a column that does not exist and could only ever report
+  "could not read". Both gates were confirmed to fail against the code they were
+  written for. Against a live tenant, twenty refused scans move the marked
+  session count by **0** with the handle-lifetime fix in place and by exactly
+  **20** with the release path stubbed out. The tenant gate also carries a
+  control on its own instrument: it counts the marker while a second marked
+  connection is held open by a cursor, and refuses to report anything if it
+  cannot see both. Without that, a marker that stopped reaching the tenant, or
+  an account that could see only its own session, would make every delta below
+  it read as a clean run.
+- a backend-growth check over 200 successful scans, and an empty-remote-result
+  scan, which is the negative control for refusing a failed fetch.
+- a **million-row transfer gate**. Two-row tests say nothing about behaviour at
+  size, and the instrument matters: resident set from `/proc/self/statm` rather
+  than `pg_backend_memory_contexts`, because the ODBC driver allocates inside
+  the backend where PostgreSQL's context accounting cannot see it. Measured,
+  two identical million-row passes differ by 40,960–65,536 bytes through
+  psqlODBC across runs (allocator granularity, not a trend) and
+  241,664 through SAP's libodbcHDB against a real tenant — a quarter of a byte
+  per row, so that difference is the driver's working set and not a per-row
+  cost. The gate refuses anything above 4MB. Each pass checks `sum(id)` against
+  `n(n+1)/2` so a short scan cannot pass as a complete one, and the same fixture
+  checks the `max_row_count` boundary on both sides and a `statement_timeout`
+  part-way through — those two in the loopback harness only; the tenant gate
+  does the transfer and the resident-set comparison and nothing else. Opt-in
+  against a tenant through `HANA_BULK_ROWS`, and reported as skipped rather than
+  passed when unset.
+
 ## 1.0.0
 Released 2026-08-13
 

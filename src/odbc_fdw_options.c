@@ -118,7 +118,18 @@ const char *
 get_odbc_attribute_name(const char* defname)
 {
 	int offset = is_odbc_attribute(defname) ? odbc_attribute_prefix_len : 0;
-	return normalized_attribute(defname + offset);
+	const char *attribute_name = defname + offset;
+
+	/*
+	 * PostgreSQL option names are identifiers and cannot contain the colon used
+	 * by SAP HANA's sessionVariable:<key> connection properties. Keep the
+	 * ordinary odbc_<property> pass-through convention, with this spelling for
+	 * the one useful colon-form property: odbc_sessionvariable_application.
+	 */
+	if (strcasecmp(attribute_name, "sessionvariable_application") == 0)
+		return "sessionVariable:APPLICATION";
+
+	return normalized_attribute(attribute_name);
 }
 
 /*
@@ -412,7 +423,13 @@ sql_data_type(
     StringInfo sql_type
 )
 {
-	initStringInfo(sql_type);
+	/*
+	 * RESET, not init. This is called once per column, and initStringInfo
+	 * palloc's a fresh 1KB buffer every time and abandons the previous one --
+	 * so importing a schema leaked a kilobyte per column across every table it
+	 * described. Callers now initialise the StringInfo once, before their loop.
+	 */
+	resetStringInfo(sql_type);
 	switch(odbc_data_type)
 	{
 	case SQL_CHAR:
