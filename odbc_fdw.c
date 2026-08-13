@@ -1847,7 +1847,23 @@ odbcIterateForeignScan(ForeignScanState *node)
 			/* Get the position of the column in the FDW table */
 			for (k=0; k<num_of_table_cols; k++)
 			{
-				if (strcmp(table_columns[k].data, (char *) ColumnName) == 0)
+				/*
+				 * Compare case-INSENSITIVELY, because the two ends fold
+				 * identifiers in OPPOSITE directions: PostgreSQL folds an
+				 * unquoted name to lower case, while SAP HANA -- like Oracle
+				 * and DB2 -- folds to upper. So
+				 *   CREATE FOREIGN TABLE t (dummy char(1)) SERVER hana
+				 *     OPTIONS (sql_query 'SELECT DUMMY FROM "SYS"."DUMMY"');
+				 * compared "dummy" against the result column "DUMMY", never
+				 * matched, and dropped the column from the mapping with no
+				 * error at all -- leaving mapped_pos == -1, which the loop
+				 * below `continue`s over, so that column's values[] slot was
+				 * never written. IMPORT FOREIGN SCHEMA escapes this only
+				 * because it double-quotes the names it emits, which is why
+				 * the failure presented as corrupt VALUES rather than as the
+				 * name-mapping bug it is.
+				 */
+				if (pg_strcasecmp(table_columns[k].data, (char *) ColumnName) == 0)
 				{
 					SQLULEN min_size = minimum_buffer_size(DataTypePtr);
 					SQLULEN max_size = MAXIMUM_BUFFER_SIZE;
