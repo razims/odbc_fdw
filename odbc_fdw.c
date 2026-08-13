@@ -210,9 +210,61 @@ result_truncation(SQLRETURN ret, SQLHSTMT stmt)
 	return truncation;
 }
 
+/*
+ * used_size + chunk_size, refusing any extent that cannot be a valid buffer.
+ *
+ * The addition itself is the hazard. used_buffer_size and chunk_size are both
+ * int, and chunk_size is recomputed from a driver-supplied SQLLEN on every
+ * truncation, so a sufficiently large or simply wrong value made the sum wrap
+ * NEGATIVE. resize_buffer then compared a negative required_size against the
+ * current size, found nothing to do, and returned without growing anything --
+ * after which SQLGetData was handed `buffer + used_buffer_size` and told it
+ * had chunk_size bytes to write into an allocation that had never been
+ * extended. That is a heap overflow reached from a value the remote controls.
+ *
+ * Checked rather than clamped on purpose: a wrapped extent means the length
+ * arithmetic has already gone wrong, and silently reading a different amount
+ * than the driver was asked for would turn a detectable fault into a wrong
+ * answer. See also MAXIMUM_FIELD_EXTENT below for the ceiling on the result.
+ */
+static int
+checked_buffer_extent(int used_size, int chunk_size)
+{
+	if (chunk_size <= 0)
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_ERROR),
+		         errmsg("odbc_fdw: invalid read chunk size %d", chunk_size),
+		         errdetail("The ODBC driver reported a length that produced a non-positive chunk size.")));
+	if (used_size < 0)
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_ERROR),
+		         errmsg("odbc_fdw: invalid accumulated field size %d", used_size)));
+	if (used_size > PG_INT32_MAX - chunk_size)
+		ereport(ERROR,
+		        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+		         errmsg("odbc_fdw: field value too large to buffer"),
+		         errdetail("Reading %d more bytes onto %d already buffered would overflow the buffer extent.",
+		                   chunk_size, used_size)));
+	return used_size + chunk_size;
+}
+
 static void
 resize_buffer(char ** buffer, int *size, int used_size, int required_size)
 {
+	/*
+	 * Refuse impossible geometry instead of allocating from it. Every caller
+	 * computes required_size from a driver-reported length, and this function
+	 * used to trust it completely: a required_size <= 0 silently did nothing
+	 * (leaving the caller to write into a buffer it believed had been grown),
+	 * and a used_size larger than required_size would memmove more bytes than
+	 * the new allocation can hold.
+	 */
+	if (used_size < 0 || required_size <= 0 || used_size > required_size)
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_ERROR),
+		         errmsg("odbc_fdw: invalid buffer geometry"),
+		         errdetail("used_size=%d required_size=%d", used_size, required_size)));
+
 	if (required_size > *size)
 	{
 		int new_size = required_size; // TODO: use min increment size, maybe in relation to current size
@@ -233,8 +285,22 @@ static const char * HEX_DIGITS = "0123456789ABCDEF";
 static char * binary_to_hex(char * buffer, int buffer_size)
 {
 	int i;
-	int hex_size = buffer_size*2;
-	char * hex = (char *) palloc(hex_size + 1);
+	int hex_size;
+	char * hex;
+
+	/*
+	 * buffer_size*2 is an int multiplication on a length that came from the
+	 * driver, so anything above INT_MAX/2 wrapped negative and palloc was
+	 * called with a negative size. Refused rather than clamped: half a value
+	 * is not a value.
+	 */
+	if (buffer_size < 0 || buffer_size > (PG_INT32_MAX - 1) / 2)
+		ereport(ERROR,
+		        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+		         errmsg("odbc_fdw: binary value of %d bytes is too large to hex-encode", buffer_size)));
+
+	hex_size = buffer_size*2;
+	hex = (char *) palloc(hex_size + 1);
 	hex[hex_size] = 0;
 	for (i=0; i<buffer_size; i++)
 	{
@@ -2020,7 +2086,8 @@ odbcIterateForeignScan(ForeignScanState *node)
 				 * stops early rather than one that stops promptly.
 				 */
 				CHECK_FOR_INTERRUPTS();
-				resize_buffer(&buffer, &buffer_size, used_buffer_size, used_buffer_size + chunk_size);
+				resize_buffer(&buffer, &buffer_size, used_buffer_size,
+				              checked_buffer_extent(used_buffer_size, chunk_size));
 				ret = SQLGetData(stmt, i, target_type, buffer + used_buffer_size, chunk_size, &result_size);
 				if (ret == SQL_NO_DATA)
 				{
@@ -2089,6 +2156,24 @@ odbcIterateForeignScan(ForeignScanState *node)
 						// we read chunk_size, but there was result_size pending in total;
 						// adjust chunk_size for the remaining, so next wil hopely be the final chunk
 						used_buffer_size += effective_chunk_size;
+						/*
+						 * result_size is a 64-bit SQLLEN and chunk_size is an
+						 * int, so this cast could TRUNCATE. A driver reporting a
+						 * total of 2^32 + 100 produced (int) 100, which then read
+						 * 100 bytes, concluded the value was complete, and
+						 * returned a silently truncated field -- and a total whose
+						 * low 32 bits happened to be negative fell through to the
+						 * extent arithmetic instead. Neither is a length this
+						 * extension can honour: a value is built into a
+						 * PostgreSQL datum, which cannot exceed 1GB anyway, so
+						 * refuse rather than cast.
+						 */
+						if (result_size > (SQLLEN) PG_INT32_MAX)
+							ereport(ERROR,
+							        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							         errmsg("odbc_fdw: field value too large to buffer"),
+							         errdetail("The ODBC driver reported a total length of " INT64_FORMAT " bytes.",
+							                   (int64) result_size)));
 						// note that we need to read result_size - effective_chunk_size more data bytes,
 						chunk_size = (int)result_size - effective_chunk_size;
 						// wait, maybe we don't need to read, just append a zero!
@@ -2096,6 +2181,17 @@ odbcIterateForeignScan(ForeignScanState *node)
 						{
 							if (!binary_data)
 							{
+								/*
+								 * Writes at used_buffer_size - 1, so it needs at
+								 * least one byte already buffered. Guarded because
+								 * a driver reporting a total equal to what it had
+								 * already delivered while delivering nothing would
+								 * otherwise write buffer[-1].
+								 */
+								if (used_buffer_size < 1)
+									ereport(ERROR,
+									        (errcode(ERRCODE_FDW_ERROR),
+									         errmsg("odbc_fdw: ODBC driver reported a complete value having returned no data")));
 								resize_buffer(&buffer, &buffer_size, used_buffer_size, used_buffer_size + 1);
 								buffer[used_buffer_size - 1] = 0;
 							}
