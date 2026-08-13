@@ -268,18 +268,22 @@ a new warning is a defect in the new code.
 PostgreSQL 18 tool image, `make docker-shell` opens it with the checkout mounted,
 and `make docker-test` runs the credential-free psqlODBC smoke test. The smoke
 test compiles and installs the extension, starts a disposable PostgreSQL
-instance, connects back into it through a real ODBC driver, checks a scan and
-import, validates a rejected ceiling, verifies both ceilings reject, and carries
-a missing-symbol negative control. It is the ordinary development gate.
+instance, connects back into it through a real ODBC driver, checks a scan and an
+import, checks that the validator refuses a malformed ceiling, that each of the
+three ceilings refuses at its boundary *while the same scan succeeds under the
+other two*, that a table cannot raise its server's ceiling, that a rescanned
+scan restarts, and carries a missing-symbol negative control. It is the ordinary
+development gate. **Building the image is not offline** — it fetches SAP's HANA
+client — so a network failure there is a build failure, not a test failure.
 
 **The HANA probe is opt-in and its configuration is local only.** `.env.example`
 is the committed template; `.env` is gitignored and holds the tenant hostname,
-credentials, expected row count and known sample value. SAP driver libraries go
-only in the gitignored `.hana-driver/` directory and are mounted read-only for
-`make docker-hana`; do not add either to an image, commit, log, issue or commit
-message. The probe verifies its configured schema+table and sample value, not
-all HANA behaviour. A new observed defect still belongs in README and a commit
-body.
+credentials, expected row count and known sample value. The Dockerfile bakes
+only the two pinned, checksum-verified HANA libraries into the development
+image; do not move the version or its digests into `.env`, and do not log a
+tenant value. `make docker-hana` verifies its configured schema+table and sample
+value, not all HANA behaviour. A new observed defect still belongs in README and
+a commit body.
 
 **`test/` is upstream's harness and it needs a LIVE ODBC source** — MySQL, SQL
 Server, Hive or PostgreSQL registered in `odbcinst.ini`, with fixtures loaded

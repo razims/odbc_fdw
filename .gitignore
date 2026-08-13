@@ -1,5 +1,6 @@
 # Generated subdirectories
 .DS_Store
+.env
 test/results/
 *.a
 *.dll

@@ -100,34 +100,45 @@ make docker-test   # compile, install and run the credential-free ODBC smoke tes
 ```
 
 `docker-test` starts a disposable PostgreSQL 18 instance and reaches a second
-database in that instance through Debian's psqlODBC driver. It proves the built
-library loads, the validator rejects invalid ceilings, schema import works, a
-scan returns the expected values, and both resource ceilings refuse at their
-boundaries. It also has a deliberately-invalid C symbol control, so success of
-`CREATE EXTENSION` is evidence that symbol resolution was actually checked.
+database in that instance through Debian's psqlODBC driver — a real ODBC remote,
+so the whole path is exercised rather than only the parts reachable without one.
+It checks that the built library loads, that `IMPORT FOREIGN SCHEMA` works, that
+a scan returns the expected values, that the validator refuses a malformed
+ceiling at DDL time, that each of the three ceilings refuses at its boundary
+*while the same scan succeeds under the other two*, that a foreign table cannot
+raise a ceiling set on its server, and that a rescanned foreign scan restarts.
+It also carries a deliberately-invalid C symbol control, which is what makes the
+success of `CREATE EXTENSION` evidence that symbol resolution was checked rather
+than assumed.
+
+Two honest caveats. The smoke test needs no credentials, but **building the
+image needs network access to SAP**, because the development image bakes the HANA
+client described below — there is no offline build. And upstream's `test/`
+regression harness is not part of any of this; see Testing at the end.
 
 ### Optional HANA 2.0 probe
 
-The HANA probe is opt-in and never runs as part of the normal Docker build or
-smoke test. Copy `.env.example` to `.env`, add the tenant's read-only probe
-details and expected single sample value, and place SAP's driver libraries in
-the gitignored `.hana-driver/` directory. Neither location is committed or
-included in the Docker image. Use the Linux libraries that match Docker's
-platform, including `libSQLDBCHDB.so` when it is required by the tested client.
+The HANA probe is opt-in and never contacts a tenant during the normal smoke
+test. The Docker development image **does** bake SAP HANA Client 2.29.25 during
+its build: only `libodbcHDB.so` and `libSQLDBCHDB.so`, fetched over HTTPS and
+verified against pinned archive and per-library SHA-256 values for `amd64` and
+`arm64`. Copy `.env.example` to `.env` and add the tenant's read-only probe
+details and expected single sample value. The gitignored `.env` is never copied
+into the Docker build context or image.
 
 ```sh
 cp .env.example .env
-# Edit .env locally, copy SAP libraries to .hana-driver/, then:
+# Edit .env locally, then:
 make docker-hana
 ```
 
-The probe creates a disposable local PostgreSQL instance, registers the mounted
-driver only for that process, imports the configured HANA schema/table, and
-checks the imported row count and named sample column against `.env`. It prints
-only a pass/fail result, not the connection string, password or returned value.
-A successful probe establishes the configured schema+table and value-binding
-paths against that tenant; it does not claim that every HANA type or driver
-option is covered.
+The probe creates a disposable local PostgreSQL instance, uses the HDBODBC
+driver registered in the development image, imports the configured HANA
+schema/table, and checks the imported row count and named sample column against
+`.env`. It prints only a pass/fail result, not the connection string, password
+or returned value. A successful probe establishes the configured schema+table
+and value-binding paths against that tenant; it does not claim that every HANA
+type or driver option is covered.
 
 ---
 
