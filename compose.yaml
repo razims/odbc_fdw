@@ -23,4 +23,22 @@ services:
     working_dir: /workspace
     env_file:
       - .env
-    command: ["bash", "/workspace/docker/probe-hana.sh"]
+    command: ["bash", "/workspace/test/hana/probe-hana.sh"]
+
+  hana-seed:
+    build:
+      context: .
+      target: test-runner
+    working_dir: /workspace
+    env_file:
+      - .env
+    command: ["bash", "/workspace/test/hana/seed-hana.sh"]
+
+  hana-clean:
+    build:
+      context: .
+      target: test-runner
+    working_dir: /workspace
+    env_file:
+      - .env
+    command: ["bash", "/workspace/test/hana/clean-hana.sh"]

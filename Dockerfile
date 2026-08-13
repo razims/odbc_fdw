@@ -88,7 +88,12 @@ FROM dev AS test-runner
 
 # Copy only the extension and test harness. In particular, .env is excluded
 # from the build context by .dockerignore.
-COPY Makefile odbc_fdw.c odbc_fdw.control /workspace/
+COPY Makefile odbc_fdw.control /workspace/
+COPY src/ /workspace/src/
 COPY odbc_fdw--*.sql /workspace/
 COPY docker/ /workspace/docker/
-RUN chmod +x /workspace/docker/run-local-tests.sh /workspace/docker/probe-hana.sh
+COPY test/hana/ /workspace/test/hana/
+RUN cc -std=c11 -Wall -Wextra -Werror -O2 /workspace/test/hana/hana-exec.c \
+        -lodbc -o /usr/local/bin/hana-exec \
+    && chmod 0555 /usr/local/bin/hana-exec \
+    && chmod +x /workspace/docker/*.sh /workspace/test/hana/*.sh

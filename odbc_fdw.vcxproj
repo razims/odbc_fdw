@@ -72,6 +72,11 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="odbc_fdw.c" />
+    <ClCompile Include="src\odbc_fdw.c" />
+    <ClCompile Include="src\odbc_fdw_options.c" />
+    <ClCompile Include="src\odbc_fdw_odbc.c" />
+    <ClCompile Include="src\odbc_fdw_scan.c" />
+    <ClCompile Include="src\odbc_fdw_import.c" />
+    <ClInclude Include="src\odbc_fdw.h" />
   </ItemGroup>
 </Project>

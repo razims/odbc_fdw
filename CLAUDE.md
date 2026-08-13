@@ -6,10 +6,12 @@ Instructions for working in this repository.
 
 Softinent's vendored **ODBC foreign-data wrapper for PostgreSQL**, derived from
 `devrimgunduz/odbc_fdw` at commit `ee741f5` (its tag `0.6.1`), itself derived
-from CartoDB's `odbc_fdw`. One C file does essentially all the work
-(`odbc_fdw.c`, ~3000 lines) plus a control file, a SQL script and a PGXS
-Makefile. There is no application here: it is a shared library loaded into a
-PostgreSQL backend, so almost every mistake is a memory-safety mistake.
+from CartoDB's `odbc_fdw`. The implementation is organised below `src/`: FDW
+registration, options, ODBC connections/catalog helpers, scan execution, and
+schema import each have a focused compilation unit, with `odbc_fdw.h` defining
+their private contract. There is no application here: it is a shared library
+loaded into a PostgreSQL backend, so almost every mistake is a memory-safety
+mistake.
 
 **Target: PostgreSQL 18.** That is the only major version this release has been
 compiled and exercised against, and the only one the README claims. It is
@@ -192,9 +194,9 @@ condition: the notice travels with the software. Meet it precisely.
 - **Every existing copyright notice stays**, wherever it is: PostgreSQL Global
   Development Group 2011, CARTO (2016 in the Makefile, 2016–2018 in the control
   file, 2016–2020 in the SQL script), Zheng Yang and Gunnar "Nick" Bluth as
-  authors in `odbc_fdw.c`, Devrim Gündüz in `LICENSE`.
+  authors in `src/odbc_fdw.c`, Devrim Gündüz in `LICENSE`.
 - The files do **not** carry the same set of notices and must not be made
-  uniform. `odbc_fdw.c` has no CARTO line; adding one would be inventing a
+  uniform. `src/odbc_fdw.c` has no CARTO line; adding one would be inventing a
   notice on somebody else's behalf.
 - **`Copyright (c) 2026, Softinent` goes BELOW** the existing lines, in files we
   substantially modify. Keep the year current for new work.
@@ -278,12 +280,15 @@ client — so a network failure there is a build failure, not a test failure.
 
 **The HANA probe is opt-in and its configuration is local only.** `.env.example`
 is the committed template; `.env` is gitignored and holds the tenant hostname,
-credentials, expected row count and known sample value. The Dockerfile bakes
-only the two pinned, checksum-verified HANA libraries into the development
-image; do not move the version or its digests into `.env`, and do not log a
-tenant value. `make docker-hana` verifies its configured schema+table and sample
-value, not all HANA behaviour. A new observed defect still belongs in README and
-a commit body.
+credentials and a dedicated existing `HANA_SCHEMA`. The seed creates, replaces
+or removes only the three `ODBC_FDW_*` fixture tables in that schema; it never
+creates or drops a schema. The Dockerfile bakes only the two pinned,
+checksum-verified HANA libraries into the development image; do not move the
+version or its digests into `.env`, and do not log a tenant value. Run
+`make docker-hana-seed` before `make docker-hana`; the latter verifies direct
+and imported reads, query tables, large values, rescan behaviour, limits and the
+zero-column refusal. A new observed defect still belongs in README and a commit
+body.
 
 **`test/` is upstream's harness and it needs a LIVE ODBC source** — MySQL, SQL
 Server, Hive or PostgreSQL registered in `odbcinst.ini`, with fixtures loaded

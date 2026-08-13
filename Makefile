@@ -16,7 +16,12 @@
 ##########################################################################
 
 MODULE_big = odbc_fdw
-OBJS = odbc_fdw.o
+OBJS = \
+	src/odbc_fdw.o \
+	src/odbc_fdw_options.o \
+	src/odbc_fdw_odbc.o \
+	src/odbc_fdw_scan.o \
+	src/odbc_fdw_import.o
 
 EXTENSION = odbc_fdw
 
@@ -37,7 +42,7 @@ ifdef DEBUG
 override CFLAGS += -DDEBUG -g -O0
 endif
 
-DOCKER_GOALS = docker-build docker-shell docker-test docker-hana
+DOCKER_GOALS = docker-build docker-shell docker-test docker-hana docker-hana-seed docker-hana-clean
 NON_DOCKER_GOALS = $(filter-out $(DOCKER_GOALS),$(MAKECMDGOALS))
 
 # A Docker-only command must be usable on a host with no PostgreSQL headers or
@@ -64,10 +69,10 @@ integration_tests:
 
 DOCKER_COMPOSE ?= docker compose
 
-.PHONY: docker-build docker-shell docker-test docker-hana
+.PHONY: docker-build docker-shell docker-test docker-hana docker-hana-seed docker-hana-clean
 
 # Docker is the supported development environment. The local smoke test needs
-# no credentials; the HANA probe is opt-in and reads the gitignored .env file.
+# no credentials; the HANA suite is opt-in and reads the gitignored .env file.
 docker-build:
 	$(DOCKER_COMPOSE) build dev
 
@@ -82,3 +87,13 @@ docker-test:
 docker-hana:
 	$(DOCKER_COMPOSE) build hana
 	$(DOCKER_COMPOSE) run --rm hana
+
+# This is deliberately separate from docker-hana: it replaces or removes only
+# ODBC_FDW_* fixture tables in HANA_SCHEMA.
+docker-hana-seed:
+	$(DOCKER_COMPOSE) build hana-seed
+	$(DOCKER_COMPOSE) run --rm hana-seed
+
+docker-hana-clean:
+	$(DOCKER_COMPOSE) build hana-clean
+	$(DOCKER_COMPOSE) run --rm hana-clean

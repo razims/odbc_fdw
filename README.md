@@ -118,27 +118,37 @@ regression harness is not part of any of this; see Testing at the end.
 
 ### Optional HANA 2.0 probe
 
-The HANA probe is opt-in and never contacts a tenant during the normal smoke
+The HANA suite is opt-in and never contacts a tenant during the normal smoke
 test. The Docker development image **does** bake SAP HANA Client 2.29.25 during
 its build: only `libodbcHDB.so` and `libSQLDBCHDB.so`, fetched over HTTPS and
 verified against pinned archive and per-library SHA-256 values for `amd64` and
-`arm64`. Copy `.env.example` to `.env` and add the tenant's read-only probe
-details and expected single sample value. The gitignored `.env` is never copied
+`arm64`. Copy `.env.example` to `.env` and add the tenant connection details
+plus the dedicated existing `HANA_SCHEMA`. The gitignored `.env` is never copied
 into the Docker build context or image.
 
 ```sh
 cp .env.example .env
-# Edit .env locally, then:
+# Edit .env locally, then create or replace only ODBC_FDW_* fixture tables:
+make docker-hana-seed
 make docker-hana
+# Remove just those fixture tables when finished:
+make docker-hana-clean
 ```
 
-The probe creates a disposable local PostgreSQL instance, uses the HDBODBC
-driver registered in the development image, imports the configured HANA
-schema/table, and checks the imported row count and named sample column against
-`.env`. It prints only a pass/fail result, not the connection string, password
-or returned value. A successful probe establishes the configured schema+table
-and value-binding paths against that tenant; it does not claim that every HANA
-type or driver option is covered.
+The seed never creates or drops `HANA_SCHEMA`; it creates, replaces or removes
+only its `ODBC_FDW_DATA_TYPES`, `ODBC_FDW_LARGE_VALUES` and `ODBC_FDW_SINGLE_ROW`
+tables. Give the configured account rights only on that dedicated test schema.
+
+The suite creates a disposable local PostgreSQL instance and uses the HDBODBC
+driver registered in the development image. It checks direct case-insensitive
+column binding, schema+table qualification, `IMPORT FOREIGN SCHEMA`, `sql_query`,
+NULLs, numeric/date/time/timestamp values, Unicode, a 12 KB NCLOB, BLOB bytes,
+and a correlated rescan. It also checks DDL-time invalid-limit rejection, all
+three resource ceilings, and the zero-column import refusal. It prints only
+assertion names and pass/fail results, never the connection string, password or
+tenant values. The suite sets `ENCRYPT=true` when requested but deliberately
+sets `SSLVALIDATECERTIFICATE=false`, matching the known-working encrypted probe
+configuration; it does not establish certificate validation.
 
 ---
 
@@ -489,13 +499,14 @@ the right ones.
 - Column types `IMPORT FOREIGN SCHEMA` can map, read from `sql_data_type`:
   `SQL_CHAR`, `SQL_WCHAR`, `SQL_VARCHAR`, `SQL_WVARCHAR`, `SQL_LONGVARCHAR`,
   `SQL_WLONGVARCHAR`, `SQL_DECIMAL`, `SQL_NUMERIC`, `SQL_INTEGER`, `SQL_REAL`,
-  `SQL_FLOAT`, `SQL_DOUBLE`, `SQL_BIT`, `SQL_SMALLINT`, `SQL_TINYINT`,
+  `SQL_FLOAT`, `SQL_DOUBLE`, `SQL_BIT`, `SQL_BOOLEAN`, `SQL_SMALLINT`, `SQL_TINYINT`,
   `SQL_BIGINT`, `SQL_DATE`, `SQL_TYPE_DATE`, `SQL_TIME`, `SQL_TYPE_TIME`,
   `SQL_TIMESTAMP`, `SQL_TYPE_TIMESTAMP`, `SQL_GUID` and `SQL_LONGVARBINARY`.
   Anything else is reported as a `NOTICE` and skipped. `SQL_BINARY` and
   `SQL_VARBINARY` are **not** in that list — their arms are commented out
   upstream with a `TODO` — which is the mechanism behind known defect 3 above.
-  (`SQL_BIT` is missing from upstream's own README; it is mapped, to `boolean`.)
+  (`SQL_BIT` and `SQL_BOOLEAN` are missing from upstream's own README; both map
+  to `boolean`.)
 - Remote encodings are handled with the `encoding` option, for any encoding
   PostgreSQL supports and that is compatible with the local database, named as
   [PostgreSQL](https://www.postgresql.org/docs/current/multibyte.html) names it.

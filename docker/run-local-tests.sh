@@ -26,8 +26,9 @@ psql_local() {
 }
 
 mkdir -p "${source_dir}"
-cp -a /workspace/Makefile /workspace/odbc_fdw.c /workspace/odbc_fdw.control \
+cp -a /workspace/Makefile /workspace/odbc_fdw.control \
     /workspace/odbc_fdw--*.sql "${source_dir}/"
+cp -a /workspace/src "${source_dir}/src"
 make -C "${source_dir}" clean
 make -C "${source_dir}" USE_PGXS=1 PG_CONFIG="${PG_CONFIG}"
 make -C "${source_dir}" install USE_PGXS=1 PG_CONFIG="${PG_CONFIG}"
