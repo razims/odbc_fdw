@@ -18,13 +18,13 @@ MODULE_big = odbc_fdw
 OBJS = odbc_fdw.o
 
 EXTENSION = odbc_fdw
-DATA = odbc_fdw--0.5.2.sql \
-  odbc_fdw--0.2.0--0.3.0.sql \
-  odbc_fdw--0.2.0--0.4.0.sql \
-  odbc_fdw--0.3.0--0.4.0.sql \
-  odbc_fdw--0.4.0--0.5.0.sql \
-  odbc_fdw--0.5.0--0.5.1.sql \
-  odbc_fdw--0.5.1--0.5.2.sql
+
+# ONE version string, and it is the same string as the git tag. Every future
+# release adds `odbc_fdw--<prev>--<new>.sql` here so ALTER EXTENSION UPDATE
+# works; for a C-only change an EMPTY upgrade script is the honest artefact,
+# because the alternative is DROP and CREATE, which CASCADEs a warehouse's
+# foreign tables away.
+DATA = odbc_fdw--1.0.0.sql
 
 TEST_DIR = test/
 REGRESS = $(notdir $(basename $(sort $(wildcard $(TEST_DIR)/sql/*test.sql))))

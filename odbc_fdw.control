@@ -14,7 +14,7 @@
 #
 ##########################################################################
 
-comment = 'Foreign data wrapper for accessing remote databases using ODBC'
-default_version = '0.5.2'
+comment = 'Foreign data wrapper for remote databases via ODBC (Softinent)'
+default_version = '1.0.0'
 module_pathname = '$libdir/odbc_fdw'
 relocatable = true

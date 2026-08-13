@@ -1,5 +1,43 @@
 # Changelog
 
+Entries from `1.0.0` onwards are Softinent's. Everything below it is the
+upstream lineage's own record, kept because it is where this code came from;
+note that those version numbers are git tags of *other* repositories and do
+not line up with any `default_version` this extension ever declared. See
+`README.md` for provenance and for the versioning rule from `1.0.0` on.
+
+## 1.0.0
+Released 2026-08-13
+
+First Softinent release, derived from `devrimgunduz/odbc_fdw` at `ee741f5`
+(its tag `0.6.1`, whose control file declared `0.5.2`). From here the git tag
+and `default_version` are one string.
+
+Fixed, each measured against a real SAP HANA 2.0 tenant and, for the first two,
+independently reproduced against psqlODBC:
+- an empty `SQL_CATALOG_NAME_SEPARATOR` produced one malformed identifier
+  instead of `schema.table`;
+- `values[]` was sized by result columns, indexed by foreign-table position and
+  never zeroed — wrong values, and a SIGSEGV that took the instance into crash
+  recovery;
+- result columns were matched to foreign-table columns with a case-sensitive
+  compare, so an up-folding remote silently lost every column;
+- three errors in the chunked `SQLGetData` loop: a decision made on an
+  uninitialised byte, an ODBC indicator added to a length unchecked, and
+  `SQL_NO_DATA` from a continuation call treated as failure.
+
+Added:
+- `CHECK_FOR_INTERRUPTS()` inside the chunked read, so one huge field is
+  cancellable;
+- bounds checks throughout the retrieval path, so a bad driver length raises
+  instead of corrupting memory;
+- `max_field_size` and `max_row_count` resource ceilings, valid on a server and
+  a table, unlimited by default, tightest wins;
+- `IMPORT FOREIGN SCHEMA` refuses to create a zero-column foreign table.
+
+Removed: the six historical upgrade scripts, CARTO's `carto-package.json`, and
+a `CONTRIBUTING.md` pointing at a tracker with issues disabled.
+
 ## 0.6.0
 Released 2026-07-06
 - Fix builds and crashes against recent PostgreSQL versions
