@@ -1,3 +1,19 @@
+/*----------------------------------------------------------
+ *
+ *        Foreign scan execution and result retrieval.
+ *
+ * Copyright (c) 2011, PostgreSQL Global Development Group
+ * Copyright (c) 2026, Softinent
+ *
+ * This software is released under the PostgreSQL Licence.
+ *
+ * Author: Zheng Yang <zhengyang4k@gmail.com>
+ * Updated to 9.2+ by Gunnar "Nick" Bluth <nick@pro-open.de>
+ *   based on tds_fdw code from Geoff Montee
+ *
+ *----------------------------------------------------------
+ */
+
 #include "odbc_fdw.h"
 static GetDataTruncation
 result_truncation(SQLRETURN ret, SQLHSTMT stmt)

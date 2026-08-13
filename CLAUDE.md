@@ -190,7 +190,15 @@ Those scripts are gone, and any future check names the file it means.
 The licence is an MIT-style grant permitting exactly what we are doing, on one
 condition: the notice travels with the software. Meet it precisely.
 
-- **`LICENSE` stays byte-identical.** Do not reword, relicense or move it.
+- **`LICENSE`'s grant text stays byte-identical.** Do not reword, relicense or
+  move it — including the sentence upstream truncated mid-clause at
+  `OUT OF OR IN CONNECTION WITH THE`, which is theirs and is left as found. The
+  only permitted changes are above the grant: the copyright block, where
+  `Copyright (c) 2026, Softinent` sits below Devrim Gündüz's line, and the
+  sentence beneath it recording that our notice covers our modifications only.
+  Adding our own notice is not relicensing; it claims nothing over anyone else's
+  work and changes no term, and the sentence says so where a reader will see it
+  rather than leaving it to be inferred.
 - **Every existing copyright notice stays**, wherever it is: PostgreSQL Global
   Development Group 2011, CARTO (2016 in the Makefile, 2016–2018 in the control
   file, 2016–2020 in the SQL script), Zheng Yang and Gunnar "Nick" Bluth as
