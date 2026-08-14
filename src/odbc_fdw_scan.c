@@ -751,6 +751,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 	List *col_position_mask = NIL;
 	List *col_size_array = NIL;
 	List *col_conversion_array = NIL;
+	List *col_type_array = NIL;
 
 	elog_debug("%s", __func__);
 
@@ -818,6 +819,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 		col_position_mask = NIL;
 		col_size_array = NIL;
 		col_conversion_array = NIL;
+		col_type_array = NIL;
 		num_of_result_cols = columns;
 		/* Once, not once per column: sql_data_type resets rather than inits. */
 		initStringInfo(&sql_type);
@@ -900,6 +902,8 @@ odbcIterateForeignScan(ForeignScanState *node)
 				                                  (int) ColumnSizePtr);
 				col_conversion_array = lappend_int(col_conversion_array,
 				                                        (int) conversion);
+				col_type_array = lappend_int(col_type_array,
+				                             (int) DataTypePtr);
 			}
 			/* if current column is not used by the foreign table */
 			else
@@ -907,6 +911,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 				col_position_mask = lappend_int(col_position_mask, -1);
 				col_size_array = lappend_int(col_size_array, -1);
 				col_conversion_array = lappend_int(col_conversion_array, 0);
+				col_type_array = lappend_int(col_type_array, 0);
 			}
 			pfree(ColumnName);
 		}
@@ -914,6 +919,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 		festate->col_position_mask = col_position_mask;
 		festate->col_size_array = col_size_array;
 		festate->col_conversion_array = col_conversion_array;
+		festate->col_type_array = col_type_array;
 		festate->first_iteration = false;
 
 		MemoryContextSwitchTo(prev_context);
@@ -924,6 +930,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 		col_position_mask = festate->col_position_mask;
 		col_size_array = festate->col_size_array;
 		col_conversion_array = festate->col_conversion_array;
+		col_type_array = festate->col_type_array;
 	}
 
 	ExecClearTuple(slot);
@@ -981,6 +988,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 			int col_size = list_nth_int(col_size_array, mask_index);
 			int mapped_pos = list_nth_int(col_position_mask, mask_index);
 			ColumnConversion conversion = list_nth_int(col_conversion_array, mask_index);
+			SQLSMALLINT odbc_type = (SQLSMALLINT) list_nth_int(col_type_array, mask_index);
 			SQLSMALLINT target_type = SQL_C_CHAR;
 			SQLLEN result_size;
 			int chunk_size, effective_chunk_size;
@@ -1237,6 +1245,34 @@ odbcIterateForeignScan(ForeignScanState *node)
 				}
 				else if (truncation == FRACTIONAL_TRUNCATION)
 				{
+					/*
+					 * Fractional truncation of a NUMBER is a wrong value, and
+					 * it is refused here rather than returned.
+					 *
+					 * ODBC defines SQLSTATE 01S07 over two groups: for numeric
+					 * types the fractional part of the number was truncated,
+					 * and for time, timestamp and interval types the fractional
+					 * part of the time was. Only the first changes a value's
+					 * magnitude, and the original code kept it either way --
+					 * the comment below says the lost digits cannot be
+					 * recovered, which is true, and then returned the number
+					 * without them, which reports nothing to the caller.
+					 *
+					 * A scan feeding a decimal column cannot distinguish that
+					 * from a correct amount, so a refusal is the only honest
+					 * answer. Sub-second precision on a temporal value keeps
+					 * the tolerant behaviour: PostgreSQL's own temporal types
+					 * round to microseconds regardless, so refusing there would
+					 * reject values it was always going to round.
+					 */
+					if (odbc_is_numeric_type(odbc_type))
+						ereport(ERROR,
+						        (errcode(ERRCODE_FDW_ERROR),
+						         errmsg("odbc_fdw: ODBC driver truncated the fractional part of result column %d",
+						                (int) i),
+						         errdetail("The driver reported SQLSTATE %s (fractional truncation) for a numeric column.",
+						                   ODBC_SQLSTATE_FRACTIONAL_TRUNCATION),
+						         errhint("The lost digits cannot be recovered, so the truncated number is refused rather than returned.")));
 					/* Fractional truncation has occurred;
 					* at this point we cannot obtain the lost digits
 					*/

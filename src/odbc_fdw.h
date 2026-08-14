@@ -141,6 +141,7 @@ typedef struct odbcFdwExecutionState
 	List            *col_position_mask;
 	List            *col_size_array;
 	List            *col_conversion_array;
+	List            *col_type_array;
 	char            *sql_count;
 	int             encoding;
 } odbcFdwExecutionState;
@@ -192,6 +193,7 @@ extern void odbcGetTableOptions(Oid foreigntableid, odbcFdwOptions *extracted_op
 extern void sql_data_type(SQLSMALLINT odbc_data_type, SQLULEN column_size,
 	SQLSMALLINT decimal_digits, SQLSMALLINT nullable, StringInfo sql_type);
 extern SQLULEN minimum_buffer_size(SQLSMALLINT odbc_data_type);
+extern bool odbc_is_numeric_type(SQLSMALLINT odbc_data_type);
 extern const char *get_odbc_attribute_name(const char *defname);
 
 /* ODBC connection and SQL helpers. */

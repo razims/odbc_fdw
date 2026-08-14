@@ -546,6 +546,41 @@ sql_data_type(
 	};
 }
 
+/*
+ * Whether an ODBC type carries a number whose fractional digits are VALUE.
+ *
+ * ODBC's fractional-truncation diagnostic, SQLSTATE 01S07, is defined over two
+ * distinct groups: for numeric types the fractional part of the NUMBER was
+ * truncated, and for time, timestamp and interval types the fractional part of
+ * the TIME was. The two mean different things to this extension. Dropping
+ * digits from a number changes its value silently and unrecoverably; dropping
+ * sub-second precision from a timestamp loses resolution that PostgreSQL's own
+ * temporal types round away in any case.
+ *
+ * This answers the first group only, so the caller can refuse the one and
+ * tolerate the other. It is a property of the ODBC type, not of any database
+ * product.
+ */
+bool
+odbc_is_numeric_type(SQLSMALLINT odbc_data_type)
+{
+	switch (odbc_data_type)
+	{
+	case SQL_DECIMAL:
+	case SQL_NUMERIC:
+	case SQL_REAL:
+	case SQL_FLOAT:
+	case SQL_DOUBLE:
+	case SQL_TINYINT:
+	case SQL_SMALLINT:
+	case SQL_INTEGER:
+	case SQL_BIGINT:
+		return true;
+	default:
+		return false;
+	};
+}
+
 SQLULEN
 minimum_buffer_size(SQLSMALLINT odbc_data_type)
 {
