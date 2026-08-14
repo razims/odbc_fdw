@@ -403,8 +403,30 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					                 &DecimalDigits, sizeof(DecimalDigits), &indicator);
 					check_return(ret, "Reading column scale", columns_stmt,
 					             SQL_HANDLE_STMT);
+					/*
+					 * A NULL scale means the driver will not state one, and that
+					 * is NOT the same as a scale of zero.
+					 *
+					 * SQLColumns defines DECIMAL_DIGITS as NULL for a type where
+					 * it does not apply, which is how a driver describes a decimal
+					 * whose scale belongs to each VALUE rather than to the column.
+					 * Collapsing that to 0 produced numeric(column_size, 0) and
+					 * rounded every fractional part away AT IMPORT TIME, reporting
+					 * nothing: a remote 3.14159 arrived as 3, in a local column
+					 * PostgreSQL then enforces as integral, so the loss survived
+					 * every later query and no scan could recover it.
+					 *
+					 * Measured, SAP HANA Client 2.29.25, SQLColumns:
+					 *   SMALLDECIMAL   COLUMN_SIZE=16  DECIMAL_DIGITS=NULL
+					 *   DECIMAL        COLUMN_SIZE=34  DECIMAL_DIGITS=NULL
+					 *   DECIMAL(18,4)  COLUMN_SIZE=18  DECIMAL_DIGITS=4
+					 *   DECIMAL(38,0)  COLUMN_SIZE=38  DECIMAL_DIGITS=0
+					 *
+					 * so an absent scale and a stated zero are distinguishable in
+					 * the metadata, and the type mapper is told which it has.
+					 */
 					if (indicator == SQL_NULL_DATA)
-						DecimalDigits = 0;
+						DecimalDigits = ODBC_SCALE_UNKNOWN;
 
 					ret = SQLGetData(columns_stmt, 11, SQL_C_SSHORT, &Nullable,
 					                 sizeof(Nullable), &indicator);

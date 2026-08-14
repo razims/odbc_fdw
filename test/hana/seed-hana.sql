@@ -1,3 +1,4 @@
+DROP TABLE "@SCHEMA@"."ODBC_FDW_SCALE_MATRIX";
 DROP TABLE "@SCHEMA@"."ODBC_FDW_FLOAT_MATRIX";
 DROP TABLE "@SCHEMA@"."ODBC_FDW_WIDE_DECIMAL";
 DROP TABLE "@SCHEMA@"."ODBC_FDW_DATA_TYPES";
@@ -161,3 +162,23 @@ INSERT INTO "@SCHEMA@"."ODBC_FDW_WIDE_DECIMAL" VALUES
 INSERT INTO "@SCHEMA@"."ODBC_FDW_WIDE_DECIMAL" VALUES
     (2, -999999999999999999999999999999999999.99,
         -99999999999999999999999999999999999999, -12345678901234.5678);
+
+-- Decimal columns whose SCALE the driver does not state, beside ones where it
+-- does. SQLColumns reports DECIMAL_DIGITS as NULL for a type whose scale is a
+-- property of each value; importing that as scale 0 rounds the fraction away
+-- at DDL time, which no later query can recover.
+--
+-- SD_VALUE and DFREE_VALUE are the unstated-scale cases, D18_4 and D38_0 the
+-- stated ones -- D38_0 in particular is a genuine scale of zero and must keep
+-- its numeric(38,0) mapping, so the fix cannot simply drop every modifier.
+CREATE COLUMN TABLE "@SCHEMA@"."ODBC_FDW_SCALE_MATRIX" (
+    "ID"          INTEGER PRIMARY KEY,
+    "SD_VALUE"    SMALLDECIMAL,
+    "DFREE_VALUE" DECIMAL,
+    "D18_4"       DECIMAL(18,4),
+    "D38_0"       DECIMAL(38,0)
+);
+INSERT INTO "@SCHEMA@"."ODBC_FDW_SCALE_MATRIX" VALUES
+    (1, 3.14159, 2.718281828459045, 1.5000, 7);
+INSERT INTO "@SCHEMA@"."ODBC_FDW_SCALE_MATRIX" VALUES
+    (2, -0.00001, -0.000000000000001, -1.5000, -7);

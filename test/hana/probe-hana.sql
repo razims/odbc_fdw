@@ -207,6 +207,10 @@ CREATE FOREIGN TABLE probe.wide_decimal_text (
     schema :'hana_schema', table 'ODBC_FDW_WIDE_DECIMAL',
     id 'ID', d38_2 'D38_2', d38_0 'D38_0', d18_4 'D18_4'
 );
+CREATE SCHEMA imported_scale;
+IMPORT FOREIGN SCHEMA :"hana_schema" LIMIT TO ("ODBC_FDW_SCALE_MATRIX")
+    FROM SERVER hana INTO imported_scale;
+
 CREATE SCHEMA imported_case;
 IMPORT FOREIGN SCHEMA :"hana_schema" LIMIT TO ("odbc_fdw_lower_table", "OdbcFdwMixedTable")
     FROM SERVER hana INTO imported_case;
@@ -226,6 +230,30 @@ SELECT 'direct_time=' || CASE WHEN
 SELECT 'direct_timestamp=' || CASE WHEN
     (SELECT timestamp_value FROM probe.direct_types WHERE id = 1) = TIMESTAMP '2024-01-02 03:04:05' AND
     (SELECT timestamp_value FROM probe.direct_types WHERE id = 2) = TIMESTAMP '2024-12-31 23:59:59'
+    THEN 'ok' ELSE 'bad' END;
+
+-- An imported column whose remote scale is unstated must not be constrained to
+-- scale 0. Predicted from the metadata above: SMALLDECIMAL and unconstrained
+-- DECIMAL import as bare numeric and keep their fractions, while DECIMAL(18,4)
+-- and DECIMAL(38,0) keep their modifiers -- the second is a real scale of zero
+-- and proves the fix distinguishes the two rather than dropping all modifiers.
+SELECT 'import_scale=' || CASE WHEN
+    (SELECT "SD_VALUE" FROM imported_scale."ODBC_FDW_SCALE_MATRIX" WHERE "ID" = 1)
+        = numeric '3.14159' AND
+    (SELECT "DFREE_VALUE" FROM imported_scale."ODBC_FDW_SCALE_MATRIX" WHERE "ID" = 1)
+        = numeric '2.718281828459045' AND
+    (SELECT "SD_VALUE" FROM imported_scale."ODBC_FDW_SCALE_MATRIX" WHERE "ID" = 2)
+        = numeric '-0.00001' AND
+    (SELECT "D18_4" FROM imported_scale."ODBC_FDW_SCALE_MATRIX" WHERE "ID" = 2)
+        = numeric '-1.5' AND
+    (SELECT "D38_0" FROM imported_scale."ODBC_FDW_SCALE_MATRIX" WHERE "ID" = 2)
+        = numeric '-7' AND
+    (SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+      WHERE attrelid = 'imported_scale."ODBC_FDW_SCALE_MATRIX"'::regclass
+        AND attname = 'SD_VALUE') = 'numeric' AND
+    (SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+      WHERE attrelid = 'imported_scale."ODBC_FDW_SCALE_MATRIX"'::regclass
+        AND attname = 'D38_0') = 'numeric(38,0)'
     THEN 'ok' ELSE 'bad' END;
 
 SELECT 'wide_decimal=' || CASE WHEN

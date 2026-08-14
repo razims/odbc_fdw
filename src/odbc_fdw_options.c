@@ -510,10 +510,30 @@ sql_data_type(
 		appendStringInfo(sql_type, "text");
 		break;
 	case SQL_DECIMAL :
-		appendStringInfo(sql_type, "decimal(%u,%d)", (unsigned)column_size, decimal_digits);
-		break;
 	case SQL_NUMERIC :
-		appendStringInfo(sql_type, "numeric(%u,%d)", (unsigned)column_size, decimal_digits);
+		{
+			/*
+			 * An unconstrained numeric whenever the remote metadata does not
+			 * pin BOTH precision and scale.
+			 *
+			 * numeric(p,s) makes PostgreSQL enforce s, so a derived scale that
+			 * is merely a guess is not a lossless description of the remote
+			 * column -- it ROUNDS on the way in. An unconstrained numeric holds
+			 * every value a numeric(p,s) holds and rounds nothing, so it is the
+			 * safe rendering when either part is unknown: a scale the driver
+			 * would not state (see ODBC_SCALE_UNKNOWN) or an absent column
+			 * size, which would otherwise have produced numeric(0,0) and been
+			 * rejected by PostgreSQL outright.
+			 */
+			const char *name = odbc_data_type == SQL_DECIMAL ? "decimal"
+			                                                 : "numeric";
+
+			if (column_size == 0 || decimal_digits < 0)
+				appendStringInfo(sql_type, "%s", name);
+			else
+				appendStringInfo(sql_type, "%s(%u,%d)", name,
+				                 (unsigned) column_size, decimal_digits);
+		}
 		break;
 	case SQL_INTEGER :
 		appendStringInfo(sql_type, "integer");

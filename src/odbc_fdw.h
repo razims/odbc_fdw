@@ -97,6 +97,12 @@
 #define ODBC_SQLSTATE_BQ_TRUNCATION "01000"
 #define ODBC_SQLSTATE_LENGTH 5
 
+/*
+ * Scale the driver declined to state, as distinct from a scale of zero. A real
+ * scale is non-negative, so a negative value cannot collide with one.
+ */
+#define ODBC_SCALE_UNKNOWN (-1)
+
 typedef enum { NO_TRUNCATION, FRACTIONAL_TRUNCATION, STRING_TRUNCATION } GetDataTruncation;
 typedef enum {
 	TEXT_CONVERSION,
