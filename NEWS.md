@@ -6,12 +6,41 @@ note that those version numbers are git tags of *other* repositories and do
 not line up with any `default_version` this extension ever declared. See
 `README.md` for provenance and for the versioning rule from `1.0.0` on.
 
-## Unreleased
+## 1.0.1
+Released 2026-08-14
 
-Not tagged, and `default_version` is deliberately still `1.0.0`. The bump
-belongs with the release cut, alongside the matching entry in `dwh`'s
-`ODBC_FDW_DATA_OK` allowlist, so a build can never report a version that `dwh`
-then refuses.
+The git tag, `default_version`, base SQL script, and upgrade path all use the
+same version string. Existing 1.0.0 installations can upgrade in place with
+`ALTER EXTENSION odbc_fdw UPDATE TO '1.0.1'`.
+
+Fixed — security and privileges:
+- driver and DSN selection is superuser-only for both the dedicated options and
+  the generic `odbc_driver`/`odbc_dsn` spellings in every catalog context;
+- text equality pushdown uses `SQLBindParameter` instead of interpolating a
+  driver-dialect string literal;
+- `ODBCTablesList`, `ODBCTableSize`, and `ODBCQuerySize` are revoked from
+  `PUBLIC`, and their C entry points require `USAGE` on the named server;
+- generated `IMPORT FOREIGN SCHEMA` SQL uses PostgreSQL's identifier and literal
+  quoting, including embedded double quotes.
+
+Fixed — metadata, planning, and data correctness:
+- exact result-column names win over a unique case-insensitive fallback, so
+  case-distinct remote columns are not collapsed onto one local attribute;
+- dropped local attributes are omitted from generated remote `SELECT` lists;
+- plain `EXPLAIN` performs no remote work; planning uses a local default estimate
+  and `EXPLAIN ANALYZE` reports rows actually retrieved;
+- `ODBCTablesList` runs `SQLTables` once per call, checks its binds/fetches, and
+  validates negative limits and truncated names;
+- ODBC metadata returns are checked, identifier buffers include their terminator,
+  column sizes are read without width mismatch, and oversized row counts are
+  refused instead of narrowed;
+- `SQL_BINARY` and `SQL_VARBINARY` now join `SQL_LONGVARBINARY` as `bytea`, and
+  `SQL_FLOAT` maps to `float8`;
+- ODBC diagnostic messages use bounded dynamic aggregation rather than repeated
+  concatenation into a fixed 513-byte buffer.
+
+Fixed — performance:
+- chunked large-value buffers grow geometrically, removing quadratic copying.
 
 Fixed — resource leaks:
 - **ODBC handles, and the remote sessions behind them, no longer outlive their
@@ -91,6 +120,51 @@ Added:
   does the transfer and the resident-set comparison and nothing else. Opt-in
   against a tenant through `HANA_BULK_ROWS`, and reported as skipped rather than
   passed when unset.
+
+Open — measured against a real HANA 2.0 tenant on 2026-08-14, NOT yet fixed here.
+Both are against released `1.0.0`, and neither is touched by the work above; the
+type matrix that found them is recorded in `dwh`'s `ODBC_FDW_DATA_OK`, which
+WITHDREW `1.0.0` from its allowlist on the strength of the first one:
+
+- **`DECIMAL` is silently truncated, and the loss is invisible downstream.** A
+  value survives only if its full text rendering — digits, plus a sign if
+  negative, plus a point if scale > 0 — is at most `max(precision, 32)`
+  characters. `col_size` comes from `SQLDescribeCol`'s `ColumnSize`, which for a
+  decimal is the PRECISION, floored at 32 by `minimum_buffer_size`;
+  `chunk_size = col_size + 1` then leaves exactly `col_size` characters plus the
+  terminator, so the sign and the decimal point are not budgeted for. What makes
+  it silent rather than merely wrong is the receiving end: `numeric(p,s)` pads
+  the missing digits back with ZEROS. Measured by predicting and then confirming
+  12 columns against the tenant — `DECIMAL(38,2)` loses its cents,
+  a negative one loses them to `.00`, and `DECIMAL(32,0)` negative comes back a
+  digit short, so the value reads as a tenth of the truth. Precision <= 30 is
+  always safe; >= 31 depends on sign and magnitude. Sizing at `precision + 3`
+  covers it.
+- **`NVARCHAR` holding any non-ASCII fails the whole scan.** `target_type` is
+  `SQL_C_CHAR` for every non-binary column, so SAP's driver is asked to convert
+  NVARCHAR to ASCII and refuses: `-10427 Conversion of parameter/column (N) from
+  data type NVARCHAR to ASCII failed`. The `encoding` server option cannot help,
+  because `pg_any_to_server` runs on bytes the driver never produced. Verified in
+  both directions that a `CHAR_AS_UTF8=TRUE` connection attribute fixes it — every
+  non-ASCII shape then reads correctly, including supplementary-plane characters,
+  which HANA stores as CESU-8 (`U+1F600` is `ED A0 BD ED B8 80` on disk) and the
+  driver converts to proper UTF-8. That is a per-connection workaround a caller
+  has to know about; binding `SQL_C_WCHAR` would fix it here instead. Loud rather
+  than silent, so it reads as a broken source rather than as wrong numbers.
+
+Two smaller findings from the same run, both fixed by the type-mapping change
+above but recorded because they were measured on the released build: `DOUBLE`
+loses its 17th significant digit through the `SQL_C_CHAR` rendering
+(`0.12345678901234566` returns `0.1234567890123456`) and `DBL_MAX` is unreadable
+outright, which binding `SQL_C_DOUBLE` would settle; and `IMPORT FOREIGN SCHEMA`
+DROPPED `BINARY`/`VARBINARY` columns with `NOTICE: Data type not supported
+(-2)/(-3)`, which is the visible half of the unmapped types — the silent half
+being that a hand-declared `bytea` column received the ASCII of the driver's hex
+rendering, so four bytes became eight.
+
+Also measured, and not defects so much as properties worth knowing: the scan
+prunes no columns and pushes down no predicate, so a single unreadable column or
+row makes an entire foreign table unreadable rather than degrading part of it.
 
 ## 1.0.0
 Released 2026-08-13

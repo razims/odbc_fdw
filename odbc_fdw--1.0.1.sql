@@ -11,7 +11,7 @@
  * Original author: Zheng Yang <zhengyang4k@gmail.com>
  *
  * IDENTIFICATION
- *                odbc_fdw/odbc_fdw--1.0.0.sql
+ *                odbc_fdw/odbc_fdw--1.0.1.sql
  *
  *-------------------------------------------------------------------------
  */
@@ -43,3 +43,8 @@ LANGUAGE C STRICT;
 CREATE FUNCTION ODBCQuerySize(text, text) RETURNS INTEGER
 AS 'MODULE_PATHNAME', 'odbc_query_size'
 LANGUAGE C STRICT;
+
+/* These functions open remote connections and must be granted deliberately. */
+REVOKE ALL ON FUNCTION ODBCTablesList(text, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ODBCTableSize(text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ODBCQuerySize(text, text) FROM PUBLIC;

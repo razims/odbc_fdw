@@ -18,11 +18,18 @@
 static GetDataTruncation
 result_truncation(SQLRETURN ret, SQLHSTMT stmt)
 {
-	SQLCHAR sqlstate[ODBC_SQLSTATE_LENGTH + 1];
+	SQLCHAR sqlstate[ODBC_SQLSTATE_LENGTH + 1] = {0};
 	GetDataTruncation truncation = NO_TRUNCATION;
 	if (ret == SQL_SUCCESS_WITH_INFO)
 	{
-		SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlstate, NULL, NULL, 0, NULL);
+		SQLRETURN diag_ret;
+
+		diag_ret = SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlstate,
+		                         NULL, NULL, 0, NULL);
+		if (!SQL_SUCCEEDED(diag_ret))
+			ereport(ERROR,
+			        (errcode(ERRCODE_FDW_ERROR),
+			         errmsg("ODBC driver returned success with info but no diagnostic record")));
 		if (strncmp((char*)sqlstate, ODBC_SQLSTATE_STRING_TRUNCATION, ODBC_SQLSTATE_LENGTH) == 0 || strncmp((char*)sqlstate, ODBC_SQLSTATE_BQ_TRUNCATION, ODBC_SQLSTATE_LENGTH) == 0)
 		{
 			truncation = STRING_TRUNCATION;
@@ -125,17 +132,68 @@ resize_buffer(char ** buffer, int *size, int used_size, int required_size)
 
 	if (required_size > *size)
 	{
-		int new_size = required_size; // TODO: use min increment size, maybe in relation to current size
-		char * new_buffer = (char *) palloc(new_size);
-		// TODO: out of memory error if !new_buffer
-		if (used_size > 0)
+		int new_size = (*size > 0) ? *size : 1024;
+
+		/* Geometric growth keeps chunked LOB reads linear in the value size. */
+		while (new_size < required_size)
 		{
-			memmove(new_buffer, *buffer, used_size);
-			pfree(*buffer);
+			if (new_size > PG_INT32_MAX / 2)
+			{
+				new_size = required_size;
+				break;
+			}
+			new_size *= 2;
 		}
-		*buffer = new_buffer;
+
+		if (*buffer == NULL)
+			*buffer = (char *) palloc(new_size);
+		else
+			*buffer = (char *) repalloc(*buffer, new_size);
 		*size = new_size;
 	}
+}
+
+/* Prefer exact identifier matches; use case folding only when unambiguous. */
+static int
+find_table_column(StringInfoData *table_columns, int num_columns,
+				  const char *result_name)
+{
+	int exact = -1;
+	int folded = -1;
+	int folded_count = 0;
+	int i;
+
+	for (i = 0; i < num_columns; i++)
+	{
+		if (table_columns[i].data == NULL)
+			continue;
+		if (strcmp(table_columns[i].data, result_name) == 0)
+		{
+			if (exact != -1)
+				ereport(ERROR,
+				        (errcode(ERRCODE_AMBIGUOUS_COLUMN),
+				         errmsg("remote result column \"%s\" maps to multiple foreign table columns",
+				                result_name)));
+			exact = i;
+		}
+		else if (pg_strcasecmp(table_columns[i].data, result_name) == 0)
+		{
+			folded = i;
+			folded_count++;
+		}
+	}
+
+	if (exact != -1)
+		return exact;
+	if (folded_count == 1)
+		return folded;
+	if (folded_count > 1)
+		ereport(ERROR,
+		        (errcode(ERRCODE_AMBIGUOUS_COLUMN),
+		         errmsg("remote result column \"%s\" has an ambiguous case-insensitive mapping",
+		                result_name),
+		         errhint("Add explicit column mappings whose remote names match exactly.")));
+	return -1;
 }
 
 static const char * HEX_DIGITS = "0123456789ABCDEF";
@@ -205,13 +263,15 @@ odbcGetQual(Node *node, TupleDesc tupdesc, List *col_mapping_list, char **key, c
 
 		if (IsA(right, Const))
 		{
-			StringInfoData  buf;
-			initStringInfo(&buf);
+			Const *constant = (Const *) right;
+
+			if (constant->constisnull)
+				return;
 			/* And get the column and value... */
 			*key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
 
-			if (((Const *) right)->consttype == PROCID_TEXTCONST)
-				*value = TextDatumGetCString(((Const *) right)->constvalue);
+			if (constant->consttype == PROCID_TEXTCONST)
+				*value = TextDatumGetCString(constant->constvalue);
 			else
 			{
 				return;
@@ -249,31 +309,16 @@ odbcGetQual(Node *node, TupleDesc tupdesc, List *col_mapping_list, char **key, c
  */
 void odbcGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
-	unsigned int table_size   = 0;
-	odbcFdwOptions options;
-
 	elog_debug("%s", __func__);
 
-	/* Fetch the foreign table options */
-	odbcGetTableOptions(foreigntableid, &options);
-
-	odbcGetTableSize(&options, &table_size);
-
-	baserel->rows = table_size;
+	/* Planning and plain EXPLAIN must never execute a remote query. */
+	baserel->rows = 1000;
 	baserel->tuples = baserel->rows;
 }
 
 void odbcEstimateCosts(PlannerInfo *root, RelOptInfo *baserel, Cost *startup_cost, Cost *total_cost, Oid foreigntableid)
 {
-	unsigned int table_size   = 0;
-	odbcFdwOptions options;
-
 	elog_debug("----> starting %s", __func__);
-
-	/* Fetch the foreign table options */
-	odbcGetTableOptions(foreigntableid, &options);
-
-	odbcGetTableSize(&options, &table_size);
 
 	*startup_cost = 25;
 
@@ -365,6 +410,7 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 
 	Relation rel;
 	int num_of_columns;
+	int live_columns = 0;
 	StringInfoData *columns;
 	int i;
 	ListCell *col_mapping;
@@ -381,6 +427,12 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	int encoding = -1;
 
 	elog_debug("%s", __func__);
+
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+	{
+		node->fdw_state = NULL;
+		return;
+	}
 
 	/* Fetch the foreign table options */
 	odbcGetTableOptions(RelationGetRelid(node->ss.ss_currentRelation), &options);
@@ -410,13 +462,17 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	/* Fetch the table column info */
 	rel = table_open(RelationGetRelid(node->ss.ss_currentRelation), AccessShareLock);
 	num_of_columns = rel->rd_att->natts;
-	columns = (StringInfoData *) palloc(sizeof(StringInfoData) * num_of_columns);
+	columns = (StringInfoData *) palloc0(sizeof(StringInfoData) * num_of_columns);
 	initStringInfo(&col_str);
 	for (i = 0; i < num_of_columns; i++)
 	{
 		StringInfoData col;
 		StringInfoData mapping;
 		bool    mapped;
+		char *escaped_column;
+
+		if (TupleDescAttr(rel->rd_att, i)->attisdropped)
+			continue;
 
 		/* retrieve the column name */
 		initStringInfo(&col);
@@ -441,9 +497,19 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 			columns[i] = mapping;
 		else
 			columns[i] = col;
-		appendStringInfo(&col_str, i == 0 ? "%s%s%s" : ",%s%s%s", (char *) quote_char.data, columns[i].data, (char *) quote_char.data);
+
+		escaped_column = escape_sql_identifier_part(columns[i].data,
+		                                             quote_char.data);
+		appendStringInfo(&col_str, live_columns == 0 ? "%s%s%s" : ",%s%s%s",
+		                 (char *) quote_char.data, escaped_column,
+		                 (char *) quote_char.data);
+		live_columns++;
 	}
 	table_close(rel, NoLock);
+	if (live_columns == 0)
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_ERROR),
+		         errmsg("foreign table has no non-dropped columns")));
 
 	/* See if we've got a qual we can push down */
 	if (node->ss.ps.plan->qual)
@@ -469,6 +535,7 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	if (!is_blank_string(options.sql_query))
 	{
 		/* Use custom query if it's available */
+		pushdown = false;
 		appendStringInfo(&sql, "%s", options.sql_query);
 	}
 	else
@@ -493,24 +560,43 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 		if (pushdown)
 		{
 			char *escaped_key = escape_sql_identifier_part(qual_key, quote_char.data);
-			char *escaped_value = escape_sql_literal(qual_value);
 
-			appendStringInfo(&sql, " WHERE %s%s%s = '%s'",
-			                 (char *) quote_char.data, escaped_key, (char *) quote_char.data, escaped_value);
+			appendStringInfo(&sql, " WHERE %s%s%s = ?",
+			                 (char *) quote_char.data, escaped_key,
+			                 (char *) quote_char.data);
 		}
 	}
 
 	/* Allocate a statement handle. */
 	odbc_allocate_statement(dbc, &stmt);
 
+	festate = (odbcFdwExecutionState *) palloc0(sizeof(odbcFdwExecutionState));
+	if (pushdown)
+	{
+		SQLULEN parameter_size;
+
+		festate->param_value = pstrdup(qual_value);
+		festate->param_value_len = (SQLLEN) strlen(festate->param_value);
+		parameter_size = (festate->param_value_len > 0) ?
+			(SQLULEN) festate->param_value_len : 1;
+		ret = SQLBindParameter(stmt, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+		                       SQL_VARCHAR, parameter_size, 0,
+		                       festate->param_value,
+		                       festate->param_value_len + 1,
+		                       &festate->param_value_len);
+		check_return(ret, "Binding ODBC query parameter", stmt,
+		             SQL_HANDLE_STMT);
+	}
+
 	elog_debug("Executing query: %s", sql.data);
 
 	/* Retrieve a list of rows */
 	ret = SQLExecDirect(stmt, (SQLCHAR *) sql.data, SQL_NTS);
 	check_return(ret, "Executing ODBC query", stmt, SQL_HANDLE_STMT);
-	SQLNumResultCols(stmt, &result_columns);
+	ret = SQLNumResultCols(stmt, &result_columns);
+	check_return(ret, "Reading ODBC result column count", stmt,
+	             SQL_HANDLE_STMT);
 
-	festate = (odbcFdwExecutionState *) palloc(sizeof(odbcFdwExecutionState));
 	festate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
 	copy_odbcFdwOptions(&(festate->options), &options);
 	festate->env = env;
@@ -518,12 +604,10 @@ odbcBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->stmt = stmt;
 	festate->table_columns = columns;
 	festate->num_of_table_cols = num_of_columns;
+	festate->num_of_result_cols = result_columns;
 	/* prepare for the first iteration, there will be some precalculation needed in the first iteration*/
 	festate->first_iteration = true;
 	festate->encoding = encoding;
-	/* festate comes from palloc, not palloc0, so this must be set explicitly */
-	festate->row_count = 0;
-	festate->result_bytes = 0;
 	festate->query = sql.data;
 	node->fdw_state = (void *) festate;
 }
@@ -539,6 +623,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 	MemoryContext prev_context;
 	/* ODBC API return status */
 	SQLRETURN ret;
+	SQLRETURN fetch_ret;
 	odbcFdwExecutionState *festate = (odbcFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	SQLSMALLINT columns;
@@ -573,7 +658,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 	 *
 	 * The gap is one level down, inside the chunked read; see the loop below.
 	 */
-	ret = SQLFetch(stmt);
+	fetch_ret = SQLFetch(stmt);
 
 	/*
 	 * A FAILED fetch is not the end of the result set.
@@ -592,10 +677,10 @@ odbcIterateForeignScan(ForeignScanState *node)
 	 * every scan. Everything else is a real failure and gets the driver's own
 	 * diagnostics.
 	 */
-	if (ret != SQL_NO_DATA)
-		check_return(ret, "Fetching row", stmt, SQL_HANDLE_STMT);
+	if (fetch_ret != SQL_NO_DATA)
+		check_return(fetch_ret, "Fetching row", stmt, SQL_HANDLE_STMT);
 
-	SQLNumResultCols(stmt, &columns);
+	columns = (SQLSMALLINT) festate->num_of_result_cols;
 
 	/*
 	 * If this is the first iteration,
@@ -610,8 +695,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 		SQLSMALLINT DecimalDigitsPtr;
 		SQLSMALLINT NullablePtr;
 		int i;
-		int k;
-		bool found;
+		int mapped_pos;
 
 		StringInfoData sql_type;
 
@@ -628,17 +712,23 @@ odbcIterateForeignScan(ForeignScanState *node)
 		for (i = 1; i <= columns; i++)
 		{
 			ColumnConversion conversion = TEXT_CONVERSION;
-			found = false;
-			ColumnName = (SQLCHAR *) palloc(sizeof(SQLCHAR) * MAXIMUM_COLUMN_NAME_LEN);
-			SQLDescribeCol(stmt,
-			               i,                       /* ColumnName */
-			               ColumnName,
-			               sizeof(SQLCHAR) * MAXIMUM_COLUMN_NAME_LEN, /* BufferLength */
-			               &NameLengthPtr,
-			               &DataTypePtr,
-			               &ColumnSizePtr,
-			               &DecimalDigitsPtr,
-			               &NullablePtr);
+			ColumnName = (SQLCHAR *) palloc0(MAXIMUM_COLUMN_NAME_LEN + 1);
+			ret = SQLDescribeCol(stmt,
+			                     i,
+			                     ColumnName,
+			                     MAXIMUM_COLUMN_NAME_LEN + 1,
+			                     &NameLengthPtr,
+			                     &DataTypePtr,
+			                     &ColumnSizePtr,
+			                     &DecimalDigitsPtr,
+			                     &NullablePtr);
+			check_return(ret, "Describing ODBC result column", stmt,
+			             SQL_HANDLE_STMT);
+			if (NameLengthPtr > MAXIMUM_COLUMN_NAME_LEN)
+				ereport(ERROR,
+				        (errcode(ERRCODE_NAME_TOO_LONG),
+				         errmsg("ODBC result column name exceeds %d bytes",
+				                MAXIMUM_COLUMN_NAME_LEN)));
 
 			sql_data_type(DataTypePtr, ColumnSizePtr, DecimalDigitsPtr, NullablePtr, &sql_type);
 			if (strcmp("bytea", (char*)sql_type.data) == 0)
@@ -654,43 +744,27 @@ odbcIterateForeignScan(ForeignScanState *node)
 				conversion = BIN_CONVERSION;
 			}
 
-			/* Get the position of the column in the FDW table */
-			for (k=0; k<num_of_table_cols; k++)
+			/* Get the position of the column in the FDW table. */
+			mapped_pos = find_table_column(table_columns, num_of_table_cols,
+			                               (char *) ColumnName);
+			if (mapped_pos >= 0)
 			{
-				/*
-				 * Compare case-INSENSITIVELY, because the two ends fold
-				 * identifiers in OPPOSITE directions: PostgreSQL folds an
-				 * unquoted name to lower case, while SAP HANA -- like Oracle
-				 * and DB2 -- folds to upper. So
-				 *   CREATE FOREIGN TABLE t (dummy char(1)) SERVER hana
-				 *     OPTIONS (sql_query 'SELECT DUMMY FROM "SYS"."DUMMY"');
-				 * compared "dummy" against the result column "DUMMY", never
-				 * matched, and dropped the column from the mapping with no
-				 * error at all -- leaving mapped_pos == -1, which the loop
-				 * below `continue`s over, so that column's values[] slot was
-				 * never written. IMPORT FOREIGN SCHEMA escapes this only
-				 * because it double-quotes the names it emits, which is why
-				 * the failure presented as corrupt VALUES rather than as the
-				 * name-mapping bug it is.
-				 */
-				if (pg_strcasecmp(table_columns[k].data, (char *) ColumnName) == 0)
-				{
-					SQLULEN min_size = minimum_buffer_size(DataTypePtr);
-					SQLULEN max_size = MAXIMUM_BUFFER_SIZE;
-					found = true;
-					col_position_mask = lappend_int(col_position_mask, k);
-					if (ColumnSizePtr < min_size)
-						ColumnSizePtr = min_size;
-					if (ColumnSizePtr > max_size)
-						ColumnSizePtr = max_size;
+				SQLULEN min_size = minimum_buffer_size(DataTypePtr);
+				SQLULEN max_size = MAXIMUM_BUFFER_SIZE;
 
-					col_size_array = lappend_int(col_size_array, (int) ColumnSizePtr);
-					col_conversion_array = lappend_int(col_conversion_array, (int) conversion);
-					break;
-				}
+				col_position_mask = lappend_int(col_position_mask, mapped_pos);
+				if (ColumnSizePtr < min_size)
+					ColumnSizePtr = min_size;
+				if (ColumnSizePtr > max_size)
+					ColumnSizePtr = max_size;
+
+				col_size_array = lappend_int(col_size_array,
+				                                  (int) ColumnSizePtr);
+				col_conversion_array = lappend_int(col_conversion_array,
+				                                        (int) conversion);
 			}
 			/* if current column is not used by the foreign table */
-			if (!found)
+			else
 			{
 				col_position_mask = lappend_int(col_position_mask, -1);
 				col_size_array = lappend_int(col_size_array, -1);
@@ -715,7 +789,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 	}
 
 	ExecClearTuple(slot);
-	if (SQL_SUCCEEDED(ret))
+	if (SQL_SUCCEEDED(fetch_ret))
 	{
 		SQLSMALLINT i;
 
@@ -1112,21 +1186,22 @@ void
 odbcExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
 	odbcFdwExecutionState *festate;
-	unsigned int table_size = 0;
 
 	elog_debug("%s", __func__);
 
 	festate = (odbcFdwExecutionState *) node->fdw_state;
+	if (festate == NULL)
+		return;
 
-	odbcGetTableSize(&(festate->options), &table_size);
-
-	/* Suppress file size if we're not showing cost details */
-	if (es->costs)
+	/* Report work already performed; EXPLAIN itself never runs a count query. */
+	if (es->analyze)
 	{
 #if PG_VERSION_NUM >= 110000
-		ExplainPropertyInteger("Foreign Table Size", "b", table_size, es);
+		ExplainPropertyInteger("Foreign Rows Retrieved", NULL,
+		                       festate->row_count, es);
 #else
-		ExplainPropertyLong("Foreign Table Size", table_size, es);
+		ExplainPropertyLong("Foreign Rows Retrieved",
+		                    (long) festate->row_count, es);
 #endif
 	}
 }
@@ -1197,7 +1272,9 @@ odbcReScanForeignScan(ForeignScanState *node)
 	 * the masks stay valid. Resetting would recompute them into
 	 * es_query_cxt on every rescan, which leaks for the life of the query.
 	 */
-	SQLFreeStmt(festate->stmt, SQL_CLOSE);
+	ret = SQLFreeStmt(festate->stmt, SQL_CLOSE);
+	check_return(ret, "Closing ODBC cursor for rescan", festate->stmt,
+	             SQL_HANDLE_STMT);
 	ret = SQLExecDirect(festate->stmt, (SQLCHAR *) festate->query, SQL_NTS);
 	check_return(ret, "Re-executing ODBC query", festate->stmt, SQL_HANDLE_STMT);
 

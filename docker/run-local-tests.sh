@@ -58,6 +58,29 @@ CREATE TABLE public.small (
 INSERT INTO public.small VALUES
     (1, 'first', repeat('x', 10000)),
     (2, 'second', 'small value');
+
+CREATE TABLE public.case_distinct ("A" integer, "a" integer);
+INSERT INTO public.case_distinct VALUES (1, 2);
+
+CREATE TABLE public.drop_test (a integer, b integer);
+INSERT INTO public.drop_test VALUES (1, 2);
+
+CREATE TABLE public.quoted_identifier ("a""b" integer);
+INSERT INTO public.quoted_identifier VALUES (7);
+
+CREATE TABLE public.binary_values (
+    id integer PRIMARY KEY,
+    payload bytea NOT NULL
+);
+INSERT INTO public.binary_values VALUES (1, decode('004142ff', 'hex'));
+
+CREATE TABLE public.qual_values (value text PRIMARY KEY);
+INSERT INTO public.qual_values VALUES (E'back\\slash''quote');
+
+CREATE TABLE public.explain_audit (called integer NOT NULL);
+CREATE FUNCTION public.explain_probe() RETURNS integer
+LANGUAGE sql VOLATILE
+AS 'INSERT INTO public.explain_audit VALUES (1) RETURNING 1';
 SQL
 
 psql_local fdwtest <<'SQL'
@@ -70,11 +93,91 @@ CREATE SERVER loopback FOREIGN DATA WRAPPER odbc_fdw OPTIONS (
     odbc_database 'remotedb'
 );
 CREATE USER MAPPING FOR CURRENT_USER SERVER loopback OPTIONS (odbc_uid 'postgres');
+CREATE USER MAPPING FOR PUBLIC SERVER loopback OPTIONS (odbc_uid 'postgres');
 IMPORT FOREIGN SCHEMA public LIMIT TO ("small") FROM SERVER loopback INTO ext;
+
+CREATE FOREIGN TABLE ext.case_distinct ("A" integer, "a" integer)
+SERVER loopback OPTIONS (
+    sql_query 'SELECT "A", "a" FROM public.case_distinct');
+
+CREATE FOREIGN TABLE ext.drop_test (a integer, b integer)
+SERVER loopback OPTIONS (schema 'public', table 'drop_test');
+ALTER FOREIGN TABLE ext.drop_test DROP COLUMN b;
+
+CREATE FOREIGN TABLE ext.explain_probe (id integer)
+SERVER loopback OPTIONS (
+    sql_query 'SELECT public.explain_probe() AS id');
+
+CREATE FOREIGN TABLE ext.qual_values (value text)
+SERVER loopback OPTIONS (schema 'public', table 'qual_values');
+
+CREATE ROLE driver_attacker;
+GRANT USAGE ON FOREIGN SERVER loopback TO driver_attacker;
+CREATE ROLE helper_attacker;
 SQL
 
 [[ "$(psql_local fdwtest -Atqc 'SELECT string_agg(label, chr(44) ORDER BY id) FROM ext.small')" == 'first,second' ]] \
     || fail 'the loopback ODBC scan returned unexpected values'
+
+# Result names that differ only by case must bind to their exact local columns.
+# A first-match pg_strcasecmp maps both to "A", overwrites 1 with 2, and leaves
+# "a" NULL: the silent wrong answer this assertion exists for.
+[[ "$(psql_local fdwtest -AtF '|' -qc 'SELECT "A", "a" FROM ext.case_distinct')" == '1|2' ]] \
+    || fail 'case-distinct result columns were collapsed onto one local column'
+
+# Dropped attributes remain in a TupleDesc but must not be named in the remote
+# SELECT list. PostgreSQL's internal dropped-column placeholder does not exist
+# on the remote.
+[[ "$(psql_local fdwtest -Atqc 'SELECT a FROM ext.drop_test')" == '1' ]] \
+    || fail 'a dropped foreign-table column remained in the remote query'
+
+# Every identifier emitted by IMPORT, and then by the scan it creates, must
+# survive an embedded double quote.
+psql_local fdwtest -c 'IMPORT FOREIGN SCHEMA public LIMIT TO ("quoted_identifier") FROM SERVER loopback INTO ext' >/dev/null
+[[ "$(psql_local fdwtest -Atqc 'SELECT "a""b" FROM ext.quoted_identifier')" == '7' ]] \
+    || fail 'a quoted remote identifier was not imported and scanned exactly'
+
+# SQL_VARBINARY/SQL_BINARY must be treated as bytes rather than as the ASCII
+# rendering of hexadecimal text.
+psql_local fdwtest -c 'IMPORT FOREIGN SCHEMA public LIMIT TO ("binary_values") FROM SERVER loopback INTO ext' >/dev/null
+[[ "$(psql_local fdwtest -Atqc "SELECT pg_typeof(payload)::text || '/' || encode(payload, 'hex') FROM ext.binary_values")" == 'bytea/004142ff' ]] \
+    || fail 'a binary ODBC value was not imported and returned as bytea'
+
+# A plain EXPLAIN must not connect to or execute the remote query. The function
+# behind this table makes any accidental execution externally visible.
+psql_local fdwtest -c 'EXPLAIN SELECT * FROM ext.explain_probe' >/dev/null
+[[ "$(psql_local remotedb -Atqc 'SELECT count(*) FROM public.explain_audit')" == '0' ]] \
+    || fail 'plain EXPLAIN executed a remote query'
+
+# SQLTables is executed once, then fetched to exhaustion. Re-executing it before
+# every fetch returns the first row repeatedly until rowLimit is reached.
+table_list="$(psql_local fdwtest -AtF '|' -qc "SELECT schema, name FROM ODBCTablesList('loopback', 100) ORDER BY 1, 2")"
+[[ "$(wc -l <<<"${table_list}" | tr -d ' ')" -eq "$(sort -u <<<"${table_list}" | wc -l | tr -d ' ')" ]] \
+    || fail 'ODBCTablesList repeated a catalog row instead of advancing its cursor'
+grep -qxF 'public|small' <<<"${table_list}" \
+    || fail 'ODBCTablesList did not return the expected remote table'
+
+# Bound parameters, not remote-dialect string interpolation. This value carries
+# both characters whose interaction makes cross-dialect escaping unsafe.
+[[ "$(psql_local fdwtest -Atqc "SELECT count(*) FROM ext.qual_values WHERE value = E'back\\\\slash''quote'")" == '1' ]] \
+    || fail 'a text equality predicate with quotes and backslashes was mishandled'
+
+# DRIVER/DSN decide which shared library unixODBC loads. Every spelling and
+# every catalog context must retain the superuser boundary.
+if psql_local fdwtest -c "SET ROLE driver_attacker; CREATE USER MAPPING FOR driver_attacker SERVER loopback OPTIONS (odbc_driver '/tmp/not-an-odbc-driver.so')" >/dev/null 2>&1; then
+    fail 'a non-superuser created an odbc_driver user-mapping option'
+fi
+
+# The SQL helpers are explicit remote access and must enforce server USAGE even
+# if a PUBLIC mapping exists. Function EXECUTE is checked separately below.
+psql_local fdwtest -c "GRANT EXECUTE ON FUNCTION ODBCQuerySize(text, text) TO helper_attacker" >/dev/null
+if psql_local fdwtest -c "SET ROLE helper_attacker; SELECT ODBCQuerySize('loopback', 'SELECT * FROM public.small')" >/dev/null 2>&1; then
+    fail 'ODBCQuerySize bypassed foreign-server USAGE through a PUBLIC mapping'
+fi
+psql_local fdwtest -c "REVOKE EXECUTE ON FUNCTION ODBCQuerySize(text, text) FROM helper_attacker" >/dev/null
+
+[[ "$(psql_local fdwtest -Atqc "SELECT has_function_privilege('helper_attacker', 'ODBCQuerySize(text,text)', 'EXECUTE')")" == 'f' ]] \
+    || fail 'ODBCQuerySize retained its default PUBLIC EXECUTE privilege'
 
 if psql_local fdwtest -c "CREATE FUNCTION missing_symbol() RETURNS void AS '\$libdir/odbc_fdw', 'no_such_symbol' LANGUAGE C" >/dev/null 2>&1; then
     fail 'CREATE EXTENSION symbol-resolution negative control unexpectedly succeeded'

@@ -214,7 +214,7 @@ condition: the notice travels with the software. Meet it precisely.
 ## Versioning
 
 **One string, in both namespaces.** The annotated git tag and `default_version`
-in `odbc_fdw.control` are the same characters. This release is `1.0.0`, with no
+in `odbc_fdw.control` are the same characters. This release is `1.0.1`, with no
 `v` prefix, because the tag has to be a string PostgreSQL will accept as an
 extension version.
 

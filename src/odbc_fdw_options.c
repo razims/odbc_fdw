@@ -329,21 +329,23 @@ odbc_fdw_validator(PG_FUNCTION_ARGS)
 		}
 
 		/*
-		 * The ODBC driver manager dlopen()s whatever shared library is
-		 * named by the "driver" attribute (and "dsn" indirectly selects
-		 * one via odbc.ini) - allowing an arbitrary value here is
-		 * equivalent to allowing an arbitrary shared library to be loaded
-		 * into the backend process. Restrict these two server-level
-		 * options to superusers, the same way core PostgreSQL restricts
-		 * comparably powerful FDW options (e.g. file_fdw's "filename").
+		 * DRIVER names a shared library for the driver manager to load, and
+		 * DSN selects one indirectly. Apply the privilege check to the EFFECTIVE
+		 * ODBC attribute, not only to the two unprefixed server spellings:
+		 * odbc_driver and odbc_dsn are accepted in every catalog context by the
+		 * generic pass-through path below, including user mappings a role with
+		 * server USAGE can create for itself.
 		 */
-		if (catalog == ForeignServerRelationId &&
-		    (strcmp(def->defname, "driver") == 0 || strcmp(def->defname, "dsn") == 0) &&
+		if ((strcmp(def->defname, "driver") == 0 ||
+		     strcmp(def->defname, "dsn") == 0 ||
+		     (is_odbc_attribute(def->defname) &&
+		      (pg_strcasecmp(get_odbc_attribute_name(def->defname), "DRIVER") == 0 ||
+		       pg_strcasecmp(get_odbc_attribute_name(def->defname), "DSN") == 0))) &&
 		    !superuser())
 		{
 			ereport(ERROR,
 			        (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			         errmsg("only superusers can set the \"%s\" option of an odbc_fdw server",
+			         errmsg("only superusers can set the \"%s\" option of an odbc_fdw object",
 			                def->defname)));
 		}
 
@@ -481,7 +483,7 @@ sql_data_type(
 		appendStringInfo(sql_type, "real");
 		break;
 	case SQL_FLOAT :
-		appendStringInfo(sql_type, "real");
+		appendStringInfo(sql_type, "float8");
 		break;
 	case SQL_DOUBLE :
 		appendStringInfo(sql_type, "float8");
@@ -503,16 +505,8 @@ sql_data_type(
 	case SQL_BIGINT :
 		appendStringInfo(sql_type, "bigint");
 		break;
-	/*
-	 * TODO: Implement these cases properly. See #23
-	 *
 	case SQL_BINARY :
-		appendStringInfo(sql_type, "bit(%u)", (unsigned)column_size);
-		break;
 	case SQL_VARBINARY :
-		appendStringInfo(sql_type, "varbit(%u)", (unsigned)column_size);
-		break;
-	*/
 	case SQL_LONGVARBINARY :
 		appendStringInfo(sql_type, "bytea");
 		break;

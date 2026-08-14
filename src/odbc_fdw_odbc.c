@@ -18,34 +18,6 @@
 
 static void odbcConnStr(StringInfoData *conn_str, odbcFdwOptions *options);
 /*
- * Escape a value for safe use inside a single-quoted SQL string literal,
- * by doubling every embedded single-quote character (the standard SQL
- * escaping rule, e.g. "O'Brien" -> "O''Brien"). Returns a freshly palloc'd,
- * NUL-terminated string; safe to call with value == NULL (returns "").
- *
- * This must be used for every value that gets interpolated into a SQL
- * string sent to the remote ODBC data source, to avoid SQL injection.
- */
-char *
-escape_sql_literal(const char *value)
-{
-	StringInfoData buf;
-	const char *p;
-
-	initStringInfo(&buf);
-	if (value == NULL)
-		return buf.data;
-
-	for (p = value; *p; p++)
-	{
-		if (*p == '\'')
-			appendStringInfoChar(&buf, '\'');
-		appendStringInfoChar(&buf, *p);
-	}
-	return buf.data;
-}
-
-/*
  * Escape a value for safe use as (part of) a quoted SQL identifier, by
  * doubling every embedded occurrence of the driver-reported quote
  * character (e.g. with quote_char='"', "foo""bar" -> "foo""""bar").
@@ -449,11 +421,10 @@ odbc_disconnection(SQLHENV *env, SQLHDBC *dbc)
 /*
  * Validate function
  */
-#define MAX_ERROR_MSG_LENGTH 512
-#define ERROR_MSG_SEP "\n"
+#define MAX_ERROR_MSG_LENGTH 8192
 
 void
-check_return(SQLRETURN ret, char *msg, SQLHANDLE handle, SQLSMALLINT type)
+check_return(SQLRETURN ret, const char *msg, SQLHANDLE handle, SQLSMALLINT type)
 {
 	SQLINTEGER   i = 0;
 	SQLINTEGER   native;
@@ -461,34 +432,48 @@ check_return(SQLRETURN ret, char *msg, SQLHANDLE handle, SQLSMALLINT type)
 	SQLCHAR  text[256];
 	SQLSMALLINT  len;
 	SQLRETURN    diag_ret;
-	static char error_msg[MAX_ERROR_MSG_LENGTH+1];
+	StringInfoData error_msg;
 	int err_code = ERRCODE_SYSTEM_ERROR;
 
-	strncpy(error_msg, msg, MAX_ERROR_MSG_LENGTH);
+	if (SQL_SUCCEEDED(ret))
+		return;
 
-	if (!SQL_SUCCEEDED(ret))
+	initStringInfo(&error_msg);
+	appendStringInfoString(&error_msg, msg);
+
+	#ifdef DEBUG
+	elog(DEBUG1, "Error result (%d): %s", ret, error_msg.data);
+	#endif
+	if (handle)
 	{
-		#ifdef DEBUG
-		elog(DEBUG1, "Error result (%d): %s", ret, error_msg);
-		#endif
-		if (handle)
+		for (;;)
 		{
-			do
+			memset(state, 0, sizeof(state));
+			memset(text, 0, sizeof(text));
+			diag_ret = SQLGetDiagRec(type, handle, ++i, state, &native, text,
+				                         sizeof(text), &len);
+			if (diag_ret == SQL_NO_DATA)
+				break;
+			if (!SQL_SUCCEEDED(diag_ret))
+				break;
+
+			#ifdef DEBUG
+			elog(DEBUG1, " %s:%ld:%ld:%s\n", state, (long int) i, (long int) native, text);
+			#endif
+			if (error_msg.len < MAX_ERROR_MSG_LENGTH)
 			{
-				diag_ret = SQLGetDiagRec(type, handle, ++i, state, &native, text,
-				                         sizeof(text), &len );
-				if (SQL_SUCCEEDED(diag_ret)) {
-					#ifdef DEBUG
-					elog(DEBUG1, " %s:%ld:%ld:%s\n", state, (long int) i, (long int) native, text);
-					#endif
-					strncat(error_msg, ERROR_MSG_SEP, MAX_ERROR_MSG_LENGTH - strlen(ERROR_MSG_SEP));
-					strncat(error_msg, (char *)text, MAX_ERROR_MSG_LENGTH - strlen(error_msg));
-				}
+				int remaining = MAX_ERROR_MSG_LENGTH - error_msg.len;
+
+				appendStringInfoChar(&error_msg, '\n');
+				if (remaining > 1)
+					appendBinaryStringInfo(&error_msg, (char *) text,
+					                       Min((int) strnlen((char *) text,
+					                                         sizeof(text) - 1),
+					                           remaining - 1));
 			}
-			while( diag_ret == SQL_SUCCESS );
 		}
-		ereport(ERROR, (errcode(err_code), errmsg("%s", error_msg)));
 	}
+	ereport(ERROR, (errcode(err_code), errmsg("%s", error_msg.data)));
 }
 
 /*
@@ -503,14 +488,21 @@ getNameQualifierChar(SQLHDBC dbc, StringInfoData *nq_char)
 	 * whatever was on the stack.
 	 */
 	SQLCHAR name_qualifier_char[2] = {0, 0};
+	SQLSMALLINT info_len = 0;
+	SQLRETURN ret;
 
 	elog_debug("%s", __func__);
 
-	SQLGetInfo(dbc,
-	           SQL_CATALOG_NAME_SEPARATOR,
-	           (SQLPOINTER)&name_qualifier_char,
-	           2,
-	           NULL);
+	ret = SQLGetInfo(dbc,
+	                 SQL_CATALOG_NAME_SEPARATOR,
+	                 (SQLPOINTER)&name_qualifier_char,
+	                 sizeof(name_qualifier_char),
+	                 &info_len);
+	check_return(ret, "Reading ODBC catalog separator", dbc, SQL_HANDLE_DBC);
+	if (info_len > 1)
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_ERROR),
+		         errmsg("ODBC driver returned a multi-byte catalog separator")));
 	name_qualifier_char[1] = 0; // some drivers fail to copy the trailing zero
 
 	initStringInfo(nq_char);
@@ -554,14 +546,22 @@ getQuoteChar(SQLHDBC dbc, StringInfoData *q_char)
 	 * escaping is applied to it.
 	 */
 	SQLCHAR quote_char[2] = {0, 0};
+	SQLSMALLINT info_len = 0;
+	SQLRETURN ret;
 
 	elog_debug("%s", __func__);
 
-	SQLGetInfo(dbc,
-	           SQL_IDENTIFIER_QUOTE_CHAR,
-	           (SQLPOINTER)&quote_char,
-	           2,
-	           NULL);
+	ret = SQLGetInfo(dbc,
+	                 SQL_IDENTIFIER_QUOTE_CHAR,
+	                 (SQLPOINTER)&quote_char,
+	                 sizeof(quote_char),
+	                 &info_len);
+	check_return(ret, "Reading ODBC identifier quote character", dbc,
+	             SQL_HANDLE_DBC);
+	if (info_len != 1 || quote_char[0] == ' ')
+		ereport(ERROR,
+		        (errcode(ERRCODE_FDW_ERROR),
+		         errmsg("ODBC driver does not report a usable identifier quote character")));
 	quote_char[1] = 0; // some drivers fail to copy the trailing zero
 
 	initStringInfo(q_char);
@@ -639,7 +639,7 @@ static void odbcConnStr(StringInfoData *conn_str, odbcFdwOptions* options)
  * get table size of a table
  */
 void
-odbcGetTableSize(odbcFdwOptions* options, unsigned int *size)
+odbcGetTableSize(odbcFdwOptions* options, SQLUBIGINT *size)
 {
 	SQLHENV env;
 	SQLHDBC dbc;
@@ -693,12 +693,15 @@ odbcGetTableSize(odbcFdwOptions* options, unsigned int *size)
 		}
 		else
 		{
-			if (options->sql_query[strlen(options->sql_query)-1] == ';')
-			{
-				/* Remove trailing semicolon if present */
-				options->sql_query[strlen(options->sql_query)-1] = 0;
-			}
-			appendStringInfo(&sql_str, "SELECT COUNT(*) FROM (%s) AS _odbc_fwd_count_wrapped", options->sql_query);
+			char *query = pstrdup(options->sql_query);
+			size_t query_len = strlen(query);
+
+			/* Strip a trailing terminator from our private copy, not the option. */
+			if (query_len > 0 && query[query_len - 1] == ';')
+				query[query_len - 1] = '\0';
+			appendStringInfo(&sql_str,
+			                 "SELECT COUNT(*) FROM (%s) AS _odbc_fwd_count_wrapped",
+			                 query);
 		}
 	}
 	else
@@ -711,21 +714,21 @@ odbcGetTableSize(odbcFdwOptions* options, unsigned int *size)
 
 	ret = SQLExecDirect(stmt, (SQLCHAR *) sql_str.data, SQL_NTS);
 	check_return(ret, "Executing ODBC query to get table size", stmt, SQL_HANDLE_STMT);
-	if (SQL_SUCCEEDED(ret))
-	{
-		SQLFetch(stmt);
-		/* retrieve column data as a big int */
-		ret = SQLGetData(stmt, 1, SQL_C_UBIGINT, &table_size, 0, &indicator);
-		if (SQL_SUCCEEDED(ret))
-		{
-			*size = (unsigned int) table_size;
-			elog_debug("Count query result: %lu", table_size);
-		}
-	}
-	else
-	{
-		elog(WARNING, "Error getting the table %s size", options->table);
-	}
+
+	ret = SQLFetch(stmt);
+	check_return(ret, "Fetching ODBC table size", stmt, SQL_HANDLE_STMT);
+
+	/* Retrieve the count without narrowing it to the platform's unsigned int. */
+	ret = SQLGetData(stmt, 1, SQL_C_UBIGINT, &table_size,
+	                 sizeof(table_size), &indicator);
+	check_return(ret, "Reading ODBC table size", stmt, SQL_HANDLE_STMT);
+	if (indicator == SQL_NULL_DATA)
+		ereport(ERROR,
+		        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+		         errmsg("ODBC count query returned NULL")));
+
+	*size = table_size;
+	elog_debug("Count query result: %llu", (unsigned long long) table_size);
 
 	/* Free handles, and disconnect */
 	if (stmt)
@@ -736,54 +739,23 @@ odbcGetTableSize(odbcFdwOptions* options, unsigned int *size)
 	odbc_disconnection(&env, &dbc);
 }
 
-static int strtoint(const char *nptr, char **endptr, int base)
+static Oid
+oid_from_server_name(const char *serverName)
 {
-	long val = strtol(nptr, endptr, base);
-	return (int) val;
-}
+	ForeignServer *server = GetForeignServerByName(serverName, false);
+	AclResult aclresult;
 
-static Oid oid_from_server_name(char *serverName)
-{
-	char *serverOidString;
-	char *escaped_name;
-	StringInfoData sql;
-	int serverOid;
-	HeapTuple tuple;
-	TupleDesc tupdesc;
-	int ret;
+#if PG_VERSION_NUM >= 160000
+	aclresult = object_aclcheck(ForeignServerRelationId, server->serverid,
+	                            GetUserId(), ACL_USAGE);
+#else
+	aclresult = pg_foreign_server_aclcheck(server->serverid, GetUserId(),
+	                                       ACL_USAGE);
+#endif
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_FOREIGN_SERVER, serverName);
 
-	if ((ret = SPI_connect()) < 0) {
-		elog(ERROR, "oid_from_server_name: SPI_connect returned %d", ret);
-	}
-
-	/*
-	 * serverName is an arbitrary, caller-supplied text argument (this
-	 * function backs SQL-callable functions such as odbc_tables_list()),
-	 * not a bounded identifier - build the query with a StringInfo
-	 * (grows as needed, no fixed-size buffer to overflow) and escape it
-	 * as a SQL string literal (doubling embedded quotes) to avoid SQL
-	 * injection via SPI_execute().
-	 */
-	escaped_name = escape_sql_literal(serverName);
-	initStringInfo(&sql);
-	appendStringInfo(&sql, "SELECT oid FROM pg_foreign_server where srvname = '%s'", escaped_name);
-	if ((ret = SPI_execute(sql.data, true, 1)) != SPI_OK_SELECT) {
-		elog(ERROR, "oid_from_server_name: Get server name from Oid query Failed, SP_exec returned %d.", ret);
-	}
-
-	if (SPI_processed > 0 && SPI_tuptable->vals[0] != NULL)
-	{
-		tupdesc  = SPI_tuptable->tupdesc;
-		tuple    = SPI_tuptable->vals[0];
-
-		serverOidString = SPI_getvalue(tuple, tupdesc, 1);
-		serverOid = strtoint(serverOidString, NULL, 10);
-	} else {
-		elog(ERROR, "Foreign server %s doesn't exist", serverName);
-	}
-
-	SPI_finish();
-	return serverOid;
+	return server->serverid;
 }
 
 Datum
@@ -799,7 +771,7 @@ odbc_table_size(PG_FUNCTION_ARGS)
 	 * whatever was on the stack and returned it. The two internal callers in
 	 * odbc_fdw_scan.c have always initialised to 0; these two had not.
 	 */
-	unsigned int tableSize = 0;
+	SQLUBIGINT tableSize = 0;
 	List *tableOptions = NIL;
 	Node *val = (Node *) makeString(tableName);
 	Oid serverOid;
@@ -814,8 +786,12 @@ odbc_table_size(PG_FUNCTION_ARGS)
 	serverOid = oid_from_server_name(serverName);
 	odbcGetOptions(serverOid, tableOptions, &options);
 	odbcGetTableSize(&options, &tableSize);
+	if (tableSize > PG_INT32_MAX)
+		ereport(ERROR,
+		        (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+		         errmsg("ODBC table row count exceeds integer range")));
 
-	PG_RETURN_INT32(tableSize);
+	PG_RETURN_INT32((int32) tableSize);
 }
 
 Datum
@@ -825,7 +801,7 @@ odbc_query_size(PG_FUNCTION_ARGS)
 	char *sqlQuery = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	char *defname = "sql_query";
 	/* Initialised for the reason given in odbc_table_size above. */
-	unsigned int querySize = 0;
+	SQLUBIGINT querySize = 0;
 	List *queryOptions = NIL;
 	Node *val = (Node *) makeString(sqlQuery);
 	Oid serverOid;
@@ -840,8 +816,12 @@ odbc_query_size(PG_FUNCTION_ARGS)
 	serverOid = oid_from_server_name(serverName);
 	odbcGetOptions(serverOid, queryOptions, &options);
 	odbcGetTableSize(&options, &querySize);
+	if (querySize > PG_INT32_MAX)
+		ereport(ERROR,
+		        (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+		         errmsg("ODBC query row count exceeds integer range")));
 
-	PG_RETURN_INT32(querySize);
+	PG_RETURN_INT32((int32) querySize);
 }
 
 /*
@@ -855,15 +835,12 @@ typedef struct {
 } DataBinding;
 
 typedef struct {
-	Oid serverOid;
 	DataBinding* tableResult;
 	SQLHENV env;
 	SQLHDBC dbc;
 	SQLHSTMT stmt;
-	SQLCHAR schema;
-	SQLCHAR name;
-	SQLUINTEGER rowLimit;
-	SQLUINTEGER currentRow;
+	int32 rowLimit;
+	uint64 currentRow;
 } TableDataCtx;
 
 
@@ -875,8 +852,8 @@ Datum odbc_tables_list(PG_FUNCTION_ARGS)
 	SQLUSMALLINT i;
 	SQLUSMALLINT numColumns = 5;
 	SQLUSMALLINT bufferSize = 1024;
-	SQLUINTEGER rowLimit;
-	SQLUINTEGER currentRow;
+	int32 rowLimit;
+	uint64 currentRow;
 	SQLRETURN retCode;
 
 	FuncCallContext *funcctx;
@@ -888,18 +865,22 @@ Datum odbc_tables_list(PG_FUNCTION_ARGS)
 	if (SRF_IS_FIRSTCALL()) {
 		MemoryContext oldcontext;
 		char *serverName;
-		int serverOid;
+		Oid serverOid;
 		odbcFdwOptions options;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-		datafctx = (TableDataCtx *) palloc(sizeof(TableDataCtx));
-		tableResult = (DataBinding*) palloc( numColumns * sizeof(DataBinding) );
+		datafctx = (TableDataCtx *) palloc0(sizeof(TableDataCtx));
+		tableResult = (DataBinding*) palloc0(numColumns * sizeof(DataBinding));
 
 		serverName = text_to_cstring(PG_GETARG_TEXT_PP(0));
 		serverOid = oid_from_server_name(serverName);
 
 		rowLimit = PG_GETARG_INT32(1);
+		if (rowLimit < 0)
+			ereport(ERROR,
+			        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			         errmsg("row limit must not be negative")));
 		currentRow = 0;
 
 		odbcGetOptions(serverOid, NULL, &options);
@@ -914,7 +895,13 @@ Datum odbc_tables_list(PG_FUNCTION_ARGS)
 
 		for ( i = 0 ; i < numColumns ; i++ ) {
 			retCode = SQLBindCol(stmt, i + 1, tableResult[i].TargetType, tableResult[i].TargetValuePtr, tableResult[i].BufferLength, &(tableResult[i].StrLen_or_Ind));
+			check_return(retCode, "Binding SQLTables result column", stmt,
+			             SQL_HANDLE_STMT);
 		}
+
+		retCode = SQLTables(stmt, NULL, 0, NULL, 0, NULL, 0,
+		                    (SQLCHAR *) "TABLE", SQL_NTS);
+		check_return(retCode, "Listing ODBC tables", stmt, SQL_HANDLE_STMT);
 
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 			ereport(ERROR,
@@ -924,7 +911,6 @@ Datum odbc_tables_list(PG_FUNCTION_ARGS)
 
 		attinmeta = TupleDescGetAttInMetadata(tupdesc);
 
-		datafctx->serverOid = serverOid;
 		datafctx->tableResult = tableResult;
 		datafctx->dbc = dbc;
 		datafctx->env = env;
@@ -946,23 +932,40 @@ Datum odbc_tables_list(PG_FUNCTION_ARGS)
 	currentRow = datafctx->currentRow;
 	attinmeta = funcctx->attinmeta;
 
-	retCode = SQLTables( stmt, NULL, SQL_NTS, NULL, SQL_NTS, NULL, SQL_NTS, (SQLCHAR*)"TABLE", SQL_NTS );
-	if (SQL_SUCCEEDED(retCode = SQLFetch(stmt)) && (rowLimit == 0 || currentRow < rowLimit)) {
+	if (rowLimit == 0 || currentRow < (uint64) rowLimit)
+		retCode = SQLFetch(stmt);
+	else
+		retCode = SQL_NO_DATA;
+
+	if (SQL_SUCCEEDED(retCode)) {
 		char       **values;
 		HeapTuple    tuple;
 		Datum        result;
 
-		values = (char **) palloc(2 * sizeof(char *));
-		values[0] = (char *) palloc(256 * sizeof(char));
-		values[1] = (char *) palloc(256 * sizeof(char));
-		snprintf(values[0], 256, "%s", (char *)tableResult[SQLTABLES_SCHEMA_COLUMN-1].TargetValuePtr);
-		snprintf(values[1], 256, "%s", (char *)tableResult[SQLTABLES_NAME_COLUMN-1].TargetValuePtr);
+		if (tableResult[SQLTABLES_SCHEMA_COLUMN - 1].StrLen_or_Ind >=
+		    tableResult[SQLTABLES_SCHEMA_COLUMN - 1].BufferLength ||
+		    tableResult[SQLTABLES_NAME_COLUMN - 1].StrLen_or_Ind >=
+		    tableResult[SQLTABLES_NAME_COLUMN - 1].BufferLength)
+			ereport(ERROR,
+			        (errcode(ERRCODE_NAME_TOO_LONG),
+			         errmsg("ODBC table metadata exceeds the result buffer")));
+
+		values = (char **) palloc0(2 * sizeof(char *));
+		if (tableResult[SQLTABLES_SCHEMA_COLUMN - 1].StrLen_or_Ind != SQL_NULL_DATA)
+			values[0] = (char *) tableResult[SQLTABLES_SCHEMA_COLUMN - 1].TargetValuePtr;
+		if (tableResult[SQLTABLES_NAME_COLUMN - 1].StrLen_or_Ind != SQL_NULL_DATA)
+			values[1] = (char *) tableResult[SQLTABLES_NAME_COLUMN - 1].TargetValuePtr;
 		tuple = BuildTupleFromCStrings(attinmeta, values);
 		result = HeapTupleGetDatum(tuple);
 		currentRow++;
 		datafctx->currentRow = currentRow;
 		SRF_RETURN_NEXT(funcctx, result);
 	} else {
+		if (retCode != SQL_NO_DATA)
+			check_return(retCode, "Fetching SQLTables result", stmt,
+			             SQL_HANDLE_STMT);
+		SQLFreeHandle(SQL_HANDLE_STMT, datafctx->stmt);
+		datafctx->stmt = SQL_NULL_HSTMT;
 		odbc_disconnection(&datafctx->env, &datafctx->dbc);
 		SRF_RETURN_DONE(funcctx);
 	}

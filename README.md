@@ -12,7 +12,7 @@ been compiled and exercised on, so it is the only one claimed.
 | | |
 | --- | --- |
 | Extension name | `odbc_fdw` |
-| This release | `1.0.0` — the git tag and `default_version` are the same string |
+| Latest published release | `1.0.1`; the git tag, `default_version`, base SQL script, and upgrade path use the same version |
 | Licence | PostgreSQL licence, see [`LICENSE`](LICENSE) |
 | Requires | unixODBC (`libodbc`), plus an ODBC driver for whatever you are reading |
 
@@ -279,8 +279,10 @@ CREATE USER MAPPING FOR someone SERVER src
   OPTIONS (odbc_uid 'remote_login', odbc_pwd 'secret');
 ```
 
-Any attribute may legally be set on any of the three objects, but a credential
-should only ever go here. A **server**'s options are readable by every role
+Any connection attribute except driver/DSN selection may legally be set on any
+of the three objects, but a credential should only ever go here. Driver and DSN
+selection is superuser-only, including the generic `odbc_driver` and `odbc_dsn`
+spellings. A **server**'s options are readable by every role
 (`pg_foreign_server.srvoptions`) and travel in every `pg_dump`; a user
 mapping's are blanked for anyone but the server's owner
 (`pg_user_mappings.umoptions`). Since ODBC accepts `UID` and `PWD` in the
@@ -295,7 +297,7 @@ ceilings refuse credential-shaped names.
 | `schema` | table, import | remote schema to read from |
 | `table` | table, import | remote table; also the local name for a `sql_query` table |
 | `sql_query` | table, import | SQL to run instead of reading `table`, in the remote's own dialect |
-| `sql_count` | table | SQL to count rows, for planner estimates |
+| `sql_count` | table | SQL used by the explicit size helper instead of wrapping the table/query |
 | `prefix` | import | prefix for the names of imported foreign tables |
 | `dsn` | server | Data Source Name, if you use one |
 | `driver` | server | driver name, if you do not |
@@ -331,6 +333,23 @@ which build their list from `SQLTables`. Upstream therefore accepted a name the
 remote had never had and created a foreign table with no columns; this release
 refuses that (see below), but it can only diagnose — the name is already folded
 by the time it arrives, so nothing here can recover what was meant.
+
+### Metadata helper permissions
+
+`ODBCTablesList`, `ODBCTableSize`, and `ODBCQuerySize` open a remote connection;
+`ODBCQuerySize` also accepts remote SQL. Fresh installations revoke their
+`EXECUTE` privilege from `PUBLIC`. A role must receive an explicit function
+grant and must also have `USAGE` on the named foreign server:
+
+```sql
+GRANT USAGE ON FOREIGN SERVER src TO metadata_reader;
+GRANT EXECUTE ON FUNCTION ODBCTablesList(text, integer) TO metadata_reader;
+```
+
+For an extension currently at 1.0.0, run
+`ALTER EXTENSION odbc_fdw UPDATE TO '1.0.1'`; the upgrade script applies the
+three `REVOKE` statements. Replacing only the shared library does not run an
+extension upgrade.
 
 ---
 
@@ -412,7 +431,7 @@ protection it does not give is worse than none:
 
 ---
 
-## What this release fixes relative to `ee741f5`
+## What `1.0.0` fixes relative to `ee741f5`
 
 Four defects, each measured against a real SAP HANA 2.0 tenant, and the first
 two independently reproduced against psqlODBC — so they are defects in the
@@ -495,81 +514,43 @@ Plus, beyond the defects:
 
 ---
 
-## Known defects, not fixed here
+## What `1.0.1` fixes relative to `1.0.0`
 
-Written down so they are not rediscovered in production. All are pre-existing
-behaviour from the lineage and all were observed while building this release.
-Each one says plainly whether `1.0.0` — the released version, and the only one
-`default_version` reports — still carries it.
+These changes are included in the published `1.0.1` release.
 
-1. **A cancelled or failed scan leaks the remote connection.**
-   **Fixed on master; still present in `1.0.0`.** The fix is not tagged and
-   `default_version` still reports `1.0.0`, so anything deployed from a released
-   build has this. `odbcEndForeignScan` was the only place the ODBC
-   `env`/`dbc`/`stmt` handles were freed, and the executor does not call it when
-   a scan errors out — so every error raised from inside a scan leaked a driver
-   connection for the life of the backend, and the three resource ceilings are
-   the most reliable way to reach that path, because raising is what they are
-   for. Measured: three cancelled scans left three additional sessions open on
-   the remote, and twenty scans refused by `max_row_count` left twenty. This is
-   the one item here with a consequence on **somebody else's server** that
-   nothing on ours reveals, and connection pooling makes it worse, because the
-   backend outlives the client that caused the scan. Master releases the handles
-   from a transaction and subtransaction callback, the way `postgres_fdw` does
-   with `pgfdw_xact_callback`.
-
-2. **Reading one field is quadratic in its length.** `resize_buffer` allocates
-   and `memmove`s the whole accumulated value on *every* chunk, and chunks are
-   capped at 8192 bytes, so an *n*-byte value costs on the order of
-   *n²/16384* bytes of copying. Measured: a single 60,000,000-character NCLOB
-   took about 10 seconds to read, almost none of it waiting on the network. The
-   fix is to grow geometrically; the `TODO` already in the function says as much.
-
-3. **`SQL_VARBINARY` (−3) is not mapped, so `VARBINARY` arrives as hex text.**
-   `sql_data_type` maps only `SQL_LONGVARBINARY` (−4) to `bytea`, so a column
-   the driver reports as `SQL_VARBINARY` falls through to the text path and the
-   driver's hexadecimal *rendering* is stored as if it were the value. Measured:
-   `CAST('ABCD' AS VARBINARY(10))` read back as `\x3431343234333434` — the ASCII
-   of the string `"41424344"` — instead of `\x41424344`. `SQL_BINARY` (−2) is
-   presumably affected the same way and was not tested. A silent wrong *type*,
-   which is the same class as the defects above; unfixed only because changing a
-   type mapping changes existing foreign tables and needs measuring against more
-   than one driver.
-
-4. **`EXPLAIN` executes the remote query.** `odbcBeginForeignScan` ignores its
-   `eflags`, so `EXEC_FLAG_EXPLAIN_ONLY` is never honoured: a plain
-   `EXPLAIN SELECT …` connects and runs the entire remote query, and
-   `odbcExplainForeignScan` then opens another connection for its row count — on
-   top of the two the planner already opened for the same estimate, because
-   `GetForeignRelSize` and `EstimateCosts` each count independently. Honouring
-   the flag would remove all of them, at the cost of `EXPLAIN` no longer proving
-   that the remote query parses, which is why it has not simply been done. Read
-   from the source, not separately measured.
-
-5. **`ODBCTablesList()` re-issues `SQLTables` on every row.** The call sits
-   outside the `SRF_IS_FIRSTCALL()` block, so the catalogue query is re-executed
-   before each fetch against a statement that already has an open cursor, and
-   its return code is then overwritten by the next `SQLFetch` and never checked.
-   Neither harness exercises this function and `dwh` does not use it. Read from
-   the source, not measured.
-
-6. **`IMPORT FOREIGN SCHEMA` maps `SQL_FLOAT` to `real`, which can halve its
-   precision.** In ODBC `SQL_REAL` is single precision and `SQL_FLOAT` is
-   implementation-defined precision that drivers normally report for a *double*;
-   `SQL_DOUBLE` already maps to `float8`, so the `SQL_FLOAT` arm is the one that
-   narrows. No driver reached in this release reports `SQL_FLOAT` — SAP HANA
-   reports `SQL_REAL` for `REAL` and `SQL_DOUBLE` for `DOUBLE`, which is why
-   neither harness catches it — so this is read from the source and **not
-   measured**. Not fixed here for the same reason as the binary types above:
-   changing a type mapping changes existing foreign tables, and it needs
-   measuring against a driver that actually emits `SQL_FLOAT`.
+- Failed and cancelled scans release their ODBC handles and remote sessions at
+  transaction or subtransaction end.
+- Chunked field buffers grow geometrically, making large-value assembly linear
+  rather than quadratic.
+- `SQL_BINARY`, `SQL_VARBINARY`, and `SQL_LONGVARBINARY` import as `bytea`;
+  `SQL_FLOAT` imports as `float8` rather than narrowing to `real`.
+- Plain `EXPLAIN` performs no remote connection or query. Planner estimates use
+  a local default, and `EXPLAIN ANALYZE` reports rows the scan actually read.
+- `ODBCTablesList()` executes `SQLTables` once and fetches that cursor across
+  calls instead of restarting it for every row.
+- Driver and DSN selection, including `odbc_driver` and `odbc_dsn` aliases, is
+  restricted to superusers in every object context.
+- The three SQL helper functions are no longer executable by `PUBLIC`, and each
+  call also requires `USAGE` on its named foreign server. The 1.0.0 → 1.0.1
+  upgrade script removes the old `PUBLIC` grants in place.
+- Pushed-down text equality values use `SQLBindParameter`, so driver-specific
+  backslash/string-literal rules cannot turn data into remote SQL syntax.
+- Generated import SQL quotes PostgreSQL identifiers and literals with the
+  backend's own quoting functions, including names containing `"`.
+- Diagnostic aggregation is bounded; ODBC metadata calls are checked; numeric
+  metadata is read into correctly sized types; count results cannot silently
+  narrow into the SQL helpers' `integer` return type.
+- Result-column mapping prefers exact names and permits a case-insensitive
+  fallback only when it is unique, preserving remote columns such as `"A"` and
+  `"a"`. Dropped PostgreSQL attributes are omitted from generated remote
+  `SELECT` lists.
 
 ---
 
 ## Versioning
 
 **One string, in both namespaces.** The annotated git tag and
-`default_version` in `odbc_fdw.control` are the same characters — `1.0.0` for
+`default_version` in `odbc_fdw.control` are the same characters — `1.0.1` for
 this release. Upstream let those two drift (tag `0.6.1`, `default_version`
 `0.5.2`), which forces every consumer to carry both literals by hand and means
 nothing readable from SQL can identify the build. That is over.
@@ -584,8 +565,10 @@ Ordinary semver from here, and **every release bumps it**:
 
 Each bump renames the SQL script to `odbc_fdw--<new>.sql` and adds
 `odbc_fdw--<prev>--<new>.sql` so that `ALTER EXTENSION odbc_fdw UPDATE` works.
-For a C-only change that upgrade script is **empty**, and writing an empty file
-is the right thing to do: the alternative is telling operators to
+For a genuinely C-only change that upgrade script is **empty**, and writing an
+empty file is the right thing to do. The 1.0.0 → 1.0.1 script is not empty
+because it revokes the metadata helpers from `PUBLIC`. Omitting an upgrade path
+would mean telling operators to
 `DROP EXTENSION`, which `CASCADE`s away their foreign tables and every view
 built over them.
 
@@ -602,17 +585,18 @@ the right ones.
 - Column, schema and table names are subject to PostgreSQL's
   [`NAMEDATALEN`](https://www.postgresql.org/docs/current/sql-syntax-lexical.html)
   limit of 63 bytes, and a longer name is **truncated with only a notice**.
-- Read-only. There is no `INSERT`, `UPDATE` or `DELETE` path, and the wrapper
-  pushes down nothing but the query you write in `sql_query`.
+- Read-only. There is no `INSERT`, `UPDATE` or `DELETE` path. For generated
+  table scans, a simple `text_column = constant` qual may be sent as a bound
+  ODBC parameter; all PostgreSQL quals are still rechecked locally.
 - Column types `IMPORT FOREIGN SCHEMA` can map, read from `sql_data_type`:
   `SQL_CHAR`, `SQL_WCHAR`, `SQL_VARCHAR`, `SQL_WVARCHAR`, `SQL_LONGVARCHAR`,
   `SQL_WLONGVARCHAR`, `SQL_DECIMAL`, `SQL_NUMERIC`, `SQL_INTEGER`, `SQL_REAL`,
   `SQL_FLOAT`, `SQL_DOUBLE`, `SQL_BIT`, `SQL_BOOLEAN`, `SQL_SMALLINT`, `SQL_TINYINT`,
   `SQL_BIGINT`, `SQL_DATE`, `SQL_TYPE_DATE`, `SQL_TIME`, `SQL_TYPE_TIME`,
-  `SQL_TIMESTAMP`, `SQL_TYPE_TIMESTAMP`, `SQL_GUID` and `SQL_LONGVARBINARY`.
-  Anything else is reported as a `NOTICE` and skipped. `SQL_BINARY` and
-  `SQL_VARBINARY` are **not** in that list — their arms are commented out
-  upstream with a `TODO` — which is the mechanism behind known defect 3 above.
+  `SQL_TIMESTAMP`, `SQL_TYPE_TIMESTAMP`, `SQL_GUID`, `SQL_BINARY`,
+  `SQL_VARBINARY` and `SQL_LONGVARBINARY`. Anything else is reported as a
+  `NOTICE` and skipped. All three binary forms map to `bytea`; `SQL_FLOAT` maps
+  to `float8` while `SQL_REAL` remains `real`.
   (`SQL_BIT` and `SQL_BOOLEAN` are missing from upstream's own README; both map
   to `boolean`.)
 - Remote encodings are handled with the `encoding` option, for any encoding

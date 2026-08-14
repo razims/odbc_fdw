@@ -16,42 +16,14 @@
 
 #include "odbc_fdw.h"
 static void
-appendQuotedString(StringInfo buffer, const char* text)
-{
-	static const char SINGLE_QUOTE = '\'';
-	const char *p;
-
-	appendStringInfoChar(buffer, SINGLE_QUOTE);
-
-	while (*text)
-	{
-		p = text;
-		while (*p && *p != SINGLE_QUOTE)
-		{
-			p++;
-		}
-		appendBinaryStringInfo(buffer, text, p - text);
-		if (*p == SINGLE_QUOTE)
-		{
-			appendStringInfoChar(buffer, SINGLE_QUOTE);
-			appendStringInfoChar(buffer, SINGLE_QUOTE);
-			p++;
-		}
-		text = p;
-	}
-
-	appendStringInfoChar(buffer, SINGLE_QUOTE);
-}
-
-static void
 appendOption(StringInfo str, bool first, const char* option_name, const char* option_value)
 {
 	if (!first)
 	{
 		appendStringInfo(str, ",\n");
 	}
-	appendStringInfo(str, "\"%s\" ", option_name);
-	appendQuotedString(str, option_value);
+	appendStringInfo(str, "%s %s", quote_identifier(option_name),
+	                 quote_literal_cstr(option_value));
 }
 
 List *
@@ -88,6 +60,7 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	SQLSMALLINT NameLength;
 	SQLSMALLINT DataType;
 	SQLULEN     ColumnSize;
+	SQLUBIGINT  ColumnSizeValue;
 	SQLSMALLINT DecimalDigits;
 	SQLSMALLINT Nullable;
 	int i;
@@ -138,22 +111,31 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		ret = SQLExecDirect(query_stmt, (SQLCHAR *) options.sql_query, SQL_NTS);
 		check_return(ret, "Executing ODBC query to get schema", query_stmt, SQL_HANDLE_STMT);
 
-		SQLNumResultCols(query_stmt, &result_columns);
+		ret = SQLNumResultCols(query_stmt, &result_columns);
+		check_return(ret, "Reading ODBC query result column count", query_stmt,
+		             SQL_HANDLE_STMT);
 
 		initStringInfo(&col_str);
-		ColumnName = (SQLCHAR *) palloc(sizeof(SQLCHAR) * MAXIMUM_COLUMN_NAME_LEN);
+		ColumnName = (SQLCHAR *) palloc0(MAXIMUM_COLUMN_NAME_LEN + 1);
 
 		for (i = 1; i <= result_columns; i++)
 		{
-			SQLDescribeCol(query_stmt,
-			               i,                       /* ColumnName */
-			               ColumnName,
-			               sizeof(SQLCHAR) * MAXIMUM_COLUMN_NAME_LEN, /* BufferLength */
-			               &NameLength,
-			               &DataType,
-			               &ColumnSize,
-			               &DecimalDigits,
-			               &Nullable);
+			ret = SQLDescribeCol(query_stmt,
+			                     i,
+			                     ColumnName,
+			                     MAXIMUM_COLUMN_NAME_LEN + 1,
+			                     &NameLength,
+			                     &DataType,
+			                     &ColumnSize,
+			                     &DecimalDigits,
+			                     &Nullable);
+			check_return(ret, "Describing ODBC query result column", query_stmt,
+			             SQL_HANDLE_STMT);
+			if (NameLength > MAXIMUM_COLUMN_NAME_LEN)
+				ereport(ERROR,
+				        (errcode(ERRCODE_NAME_TOO_LONG),
+				         errmsg("ODBC result column name exceeds %d bytes",
+				                MAXIMUM_COLUMN_NAME_LEN)));
 
 			sql_data_type(DataType, ColumnSize, DecimalDigits, Nullable, &sql_type);
 			if (is_blank_string(sql_type.data))
@@ -170,9 +152,17 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 				first_column = false;
 			}
 
-			appendStringInfo(&col_str, "\"%s\" %s", ColumnName, (char *) sql_type.data);
+			appendStringInfo(&col_str, "%s %s",
+			                 quote_identifier((char *) ColumnName),
+			                 (char *) sql_type.data);
 		}
-		SQLCloseCursor(query_stmt);
+		if (first_column)
+			ereport(ERROR,
+			        (errcode(ERRCODE_FDW_ERROR),
+			         errmsg("ODBC query has no column that can be imported")));
+		ret = SQLCloseCursor(query_stmt);
+		check_return(ret, "Closing ODBC query schema cursor", query_stmt,
+		             SQL_HANDLE_STMT);
 		SQLFreeHandle(SQL_HANDLE_STMT, query_stmt);
 		odbc_disconnection(&env, &dbc);
 
@@ -190,7 +180,7 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		{
 			/* Will obtain the foreign tables with SQLTables() */
 
-			SQLCHAR *table_schema = (SQLCHAR *) palloc(sizeof(SQLCHAR) * MAXIMUM_SCHEMA_NAME_LEN);
+			SQLCHAR *table_schema = (SQLCHAR *) palloc0(MAXIMUM_SCHEMA_NAME_LEN + 1);
 
 			odbc_connection(&options, &env, &dbc);
 
@@ -207,16 +197,31 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			check_return(ret, "Obtaining ODBC tables", tables_stmt, SQL_HANDLE_STMT);
 
 			initStringInfo(&col_str);
-			while (SQL_SUCCESS == ret)
+			for (;;)
 			{
 				ret = SQLFetch(tables_stmt);
-				if (SQL_SUCCESS == ret)
+				if (ret == SQL_NO_DATA)
+					break;
+				check_return(ret, "Fetching ODBC table metadata", tables_stmt,
+				             SQL_HANDLE_STMT);
+				if (SQL_SUCCEEDED(ret))
 				{
 					int excluded = false;
 					SQLRETURN getdata_ret;
-					TableName = (SQLCHAR *) palloc(sizeof(SQLCHAR) * MAXIMUM_TABLE_NAME_LEN);
-					getdata_ret = SQLGetData(tables_stmt, SQLTABLES_NAME_COLUMN, SQL_C_CHAR, TableName, MAXIMUM_TABLE_NAME_LEN, &indicator);
+					TableName = (SQLCHAR *) palloc0(MAXIMUM_TABLE_NAME_LEN + 1);
+					getdata_ret = SQLGetData(tables_stmt, SQLTABLES_NAME_COLUMN,
+					                             SQL_C_CHAR, TableName,
+					                             MAXIMUM_TABLE_NAME_LEN + 1, &indicator);
 					check_return(getdata_ret, "Reading table name", tables_stmt, SQL_HANDLE_STMT);
+					if (indicator == SQL_NULL_DATA)
+						ereport(ERROR,
+						        (errcode(ERRCODE_FDW_ERROR),
+						         errmsg("ODBC table metadata returned a NULL table name")));
+					if (indicator > MAXIMUM_TABLE_NAME_LEN)
+						ereport(ERROR,
+						        (errcode(ERRCODE_NAME_TOO_LONG),
+						         errmsg("ODBC table name exceeds %d bytes",
+						                MAXIMUM_TABLE_NAME_LEN)));
 
 					/* Since we're not filtering the SQLTables call by schema
 					   we must exclude here tables that belong to other schemas.
@@ -225,8 +230,12 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					   So we only reject tables for which the schema is not
 					   blank and different from the desired schema:
 					 */
-					getdata_ret = SQLGetData(tables_stmt, SQLTABLES_SCHEMA_COLUMN, SQL_C_CHAR, table_schema, MAXIMUM_SCHEMA_NAME_LEN, &indicator);
-					if (SQL_SUCCESS == getdata_ret)
+					getdata_ret = SQLGetData(tables_stmt, SQLTABLES_SCHEMA_COLUMN,
+					                             SQL_C_CHAR, table_schema,
+					                             MAXIMUM_SCHEMA_NAME_LEN + 1, &indicator);
+					check_return(getdata_ret, "Reading table schema", tables_stmt,
+					             SQL_HANDLE_STMT);
+					if (indicator != SQL_NULL_DATA)
 					{
 						/*
 						 * schema_name may be NULL, and strcmp against NULL is a
@@ -235,19 +244,10 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 						 * instance replays WAL, so every session in every
 						 * database on the host is taken into crash recovery.
 						 *
-						 * Two ways to arrive here with it NULL. The documented
-						 * one is OPTIONS (schema ''), which the branch near the
-						 * top of this function turns into NULL on purpose, for
-						 * schema-less sources such as Hive -- against a remote
-						 * that DOES report schemas, the first enumerated table
-						 * then crashes the instance. The other is this loop's
-						 * own error handling a few lines below, which sets
-						 * schema_name = NULL when SQLGetData fails for one
-						 * row's schema column; the next iteration reaches this
-						 * comparison with it NULL. A blank schema cannot be
-						 * matched against anything, so treat "we have no schema
-						 * to filter by" as excluding nothing, which is what the
-						 * NULL assignment below already intends.
+						 * OPTIONS (schema '') deliberately turns it into NULL
+						 * for schema-less sources such as Hive. A blank schema
+						 * cannot be matched against anything, so having no
+						 * schema filter excludes nothing.
 						 */
 						if (schema_name != NULL &&
 						    !is_blank_string((char*)table_schema) &&
@@ -255,14 +255,11 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 						{
 							excluded = true;
 						}
-					}
-					else
-					{
-						/* Some drivers don't support schemas and may return an error code here;
-						 * in that case we must avoid using an schema to query the table columns.
-						 */
-						schema_name = NULL;
-						missing_foreign_schema = false;
+						if (indicator > MAXIMUM_SCHEMA_NAME_LEN)
+							ereport(ERROR,
+							        (errcode(ERRCODE_NAME_TOO_LONG),
+							         errmsg("ODBC schema name exceeds %d bytes",
+							                MAXIMUM_SCHEMA_NAME_LEN)));
 					}
 
 					/* Since we haven't specified SQL_ALL_CATALOGS in the
@@ -300,7 +297,9 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 				}
 			}
 
-			SQLCloseCursor(tables_stmt);
+			ret = SQLCloseCursor(tables_stmt);
+			check_return(ret, "Closing ODBC table metadata cursor", tables_stmt,
+			             SQL_HANDLE_STMT);
 
 			SQLFreeHandle(SQL_HANDLE_STMT, tables_stmt);
 			odbc_disconnection(&env, &dbc);
@@ -324,7 +323,7 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		 * freed, so the cost grew with the number of tables imported; every
 		 * column overwrites it anyway, so there was never anything to keep.
 		 */
-		ColumnName = (SQLCHAR *) palloc(sizeof(SQLCHAR) * MAXIMUM_COLUMN_NAME_LEN);
+		ColumnName = (SQLCHAR *) palloc0(MAXIMUM_COLUMN_NAME_LEN + 1);
 		foreach(tables_cell, tables)
 		{
 			char *table_name = (char*)lfirst(tables_cell);
@@ -335,7 +334,7 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			ret = SQLColumns(
 			          columns_stmt,
 			          NULL, 0,
-			          (SQLCHAR*)schema_name, SQL_NTS,
+			          (SQLCHAR*)schema_name, schema_name ? SQL_NTS : 0,
 			          (SQLCHAR*)table_name,  SQL_NTS,
 			          NULL, 0
 			      );
@@ -343,21 +342,69 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
 			i = 0;
 			initStringInfo(&col_str);
-			while (SQL_NO_DATA != ret && SQL_SUCCESS_WITH_INFO != ret)
+			for (;;)
 			{
 				ret = SQLFetch(columns_stmt);
-				if (SQL_SUCCESS == ret)
+				if (ret == SQL_NO_DATA)
+					break;
+				check_return(ret, "Fetching ODBC column metadata", columns_stmt,
+				             SQL_HANDLE_STMT);
+				if (SQL_SUCCEEDED(ret))
 				{
-					ret = SQLGetData(columns_stmt, 4, SQL_C_CHAR, ColumnName, MAXIMUM_COLUMN_NAME_LEN, &indicator);
-					// check_return(ret, "Reading column name", columns_stmt, SQL_HANDLE_STMT);
-					ret = SQLGetData(columns_stmt, 5, SQL_C_SSHORT, &DataType, MAXIMUM_COLUMN_NAME_LEN, &indicator);
-					// check_return(ret, "Reading column type", columns_stmt, SQL_HANDLE_STMT);
-					ret = SQLGetData(columns_stmt, 7, SQL_C_SLONG, &ColumnSize, 0, &indicator);
-					// check_return(ret, "Reading column size", columns_stmt, SQL_HANDLE_STMT);
-					ret = SQLGetData(columns_stmt, 9, SQL_C_SSHORT, &DecimalDigits, 0, &indicator);
-					// check_return(ret, "Reading column decimals", columns_stmt, SQL_HANDLE_STMT);
-					ret = SQLGetData(columns_stmt, 11, SQL_C_SSHORT, &Nullable, 0, &indicator);
-					// check_return(ret, "Reading column nullable", columns_stmt, SQL_HANDLE_STMT);
+					ret = SQLGetData(columns_stmt, 4, SQL_C_CHAR, ColumnName,
+					                 MAXIMUM_COLUMN_NAME_LEN + 1, &indicator);
+					check_return(ret, "Reading column name", columns_stmt,
+					             SQL_HANDLE_STMT);
+					if (indicator == SQL_NULL_DATA)
+						ereport(ERROR,
+						        (errcode(ERRCODE_FDW_ERROR),
+						         errmsg("ODBC column metadata returned a NULL column name")));
+					if (indicator > MAXIMUM_COLUMN_NAME_LEN)
+						ereport(ERROR,
+						        (errcode(ERRCODE_NAME_TOO_LONG),
+						         errmsg("ODBC column name exceeds %d bytes",
+						                MAXIMUM_COLUMN_NAME_LEN)));
+
+					ret = SQLGetData(columns_stmt, 5, SQL_C_SSHORT, &DataType,
+					                 sizeof(DataType), &indicator);
+					check_return(ret, "Reading column type", columns_stmt,
+					             SQL_HANDLE_STMT);
+					if (indicator == SQL_NULL_DATA)
+						ereport(ERROR,
+						        (errcode(ERRCODE_FDW_ERROR),
+						         errmsg("ODBC column metadata returned a NULL data type")));
+
+					ColumnSizeValue = 0;
+					ret = SQLGetData(columns_stmt, 7, SQL_C_UBIGINT,
+					                 &ColumnSizeValue, sizeof(ColumnSizeValue), &indicator);
+					check_return(ret, "Reading column size", columns_stmt,
+					             SQL_HANDLE_STMT);
+					if (indicator == SQL_NULL_DATA)
+						ColumnSize = 0;
+					else
+					{
+						if (sizeof(SQLULEN) < sizeof(SQLUBIGINT) &&
+						    ColumnSizeValue > (SQLUBIGINT) ((SQLULEN) -1))
+							ereport(ERROR,
+							        (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+							         errmsg("ODBC column size is too large")));
+						ColumnSize = (SQLULEN) ColumnSizeValue;
+					}
+
+					ret = SQLGetData(columns_stmt, 9, SQL_C_SSHORT,
+					                 &DecimalDigits, sizeof(DecimalDigits), &indicator);
+					check_return(ret, "Reading column scale", columns_stmt,
+					             SQL_HANDLE_STMT);
+					if (indicator == SQL_NULL_DATA)
+						DecimalDigits = 0;
+
+					ret = SQLGetData(columns_stmt, 11, SQL_C_SSHORT, &Nullable,
+					                 sizeof(Nullable), &indicator);
+					check_return(ret, "Reading column nullability", columns_stmt,
+					             SQL_HANDLE_STMT);
+					if (indicator == SQL_NULL_DATA)
+						Nullable = SQL_NULLABLE_UNKNOWN;
+
 					sql_data_type(DataType, ColumnSize, DecimalDigits, Nullable, &sql_type);
 					if (is_blank_string(sql_type.data))
 					{
@@ -368,7 +415,9 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					{
 						appendStringInfo(&col_str, ", ");
 					}
-					appendStringInfo(&col_str, "\"%s\" %s", ColumnName, (char *) sql_type.data);
+					appendStringInfo(&col_str, "%s %s",
+					                 quote_identifier((char *) ColumnName),
+					                 (char *) sql_type.data);
 				}
 				#ifdef DEBUG
 				if (ret == SQL_ERROR || ret == SQL_SUCCESS_WITH_INFO)
@@ -389,7 +438,9 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 				}
 				#endif
 			}
-			SQLCloseCursor(columns_stmt);
+			ret = SQLCloseCursor(columns_stmt);
+			check_return(ret, "Closing ODBC column metadata cursor", columns_stmt,
+			             SQL_HANDLE_STMT);
 			SQLFreeHandle(SQL_HANDLE_STMT, columns_stmt);
 
 			/*
@@ -503,9 +554,13 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 #endif
 
 		initStringInfo(&create_statement);
-		appendStringInfo(&create_statement, "CREATE FOREIGN TABLE \"%s\".\"%s%s\" (", stmt->local_schema, prefix, (char *) table_name);
+		appendStringInfo(&create_statement, "CREATE FOREIGN TABLE %s (",
+		                 quote_qualified_identifier(stmt->local_schema,
+		                                            psprintf("%s%s", prefix,
+		                                                     table_name)));
 		appendStringInfo(&create_statement, "%s", columns);
-		appendStringInfo(&create_statement, ") SERVER %s\n", stmt->server_name);
+		appendStringInfo(&create_statement, ") SERVER %s\n",
+		                 quote_identifier(stmt->server_name));
 		appendStringInfo(&create_statement, "OPTIONS (\n");
 		foreach(option, stmt->options)
 		{

@@ -41,7 +41,7 @@
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
 #endif
-#include "executor/spi.h"
+#include "executor/executor.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "mb/pg_wchar.h"
@@ -56,6 +56,7 @@
 #include "storage/fd.h"
 #include "storage/lock.h"
 #include "utils/array.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -132,6 +133,8 @@ typedef struct odbcFdwExecutionState
 	int64           row_count;
 	int64           result_bytes;
 	char            *query;
+	char            *param_value;
+	SQLLEN          param_value_len;
 	List            *col_position_mask;
 	List            *col_size_array;
 	List            *col_conversion_array;
@@ -183,12 +186,11 @@ extern const char *get_odbc_attribute_name(const char *defname);
 extern void odbc_connection(odbcFdwOptions *options, SQLHENV *env, SQLHDBC *dbc);
 extern void odbc_disconnection(SQLHENV *env, SQLHDBC *dbc);
 extern void odbc_allocate_statement(SQLHDBC dbc, SQLHSTMT *stmt);
-extern void check_return(SQLRETURN ret, char *msg, SQLHANDLE handle, SQLSMALLINT type);
-extern void odbcGetTableSize(odbcFdwOptions *options, unsigned int *size);
+extern void check_return(SQLRETURN ret, const char *msg, SQLHANDLE handle, SQLSMALLINT type);
+extern void odbcGetTableSize(odbcFdwOptions *options, SQLUBIGINT *size);
 extern void getNameQualifierChar(SQLHDBC dbc, StringInfoData *nq_char);
 extern void getQuoteChar(SQLHDBC dbc, StringInfoData *q_char);
 extern char *get_schema_name(odbcFdwOptions *options);
-extern char *escape_sql_literal(const char *value);
 extern char *escape_sql_identifier_part(const char *value, const char *quote_char);
 
 #endif /* ODBC_FDW_H */

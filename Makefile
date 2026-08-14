@@ -30,7 +30,8 @@ EXTENSION = odbc_fdw
 # works; for a C-only change an EMPTY upgrade script is the honest artefact,
 # because the alternative is DROP and CREATE, which CASCADEs a warehouse's
 # foreign tables away.
-DATA = odbc_fdw--1.0.0.sql
+DATA = odbc_fdw--1.0.1.sql \
+       odbc_fdw--1.0.0--1.0.1.sql
 
 TEST_DIR = test/
 REGRESS = $(notdir $(basename $(sort $(wildcard $(TEST_DIR)/sql/*test.sql))))
