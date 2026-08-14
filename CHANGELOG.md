@@ -6,6 +6,29 @@ note that those version numbers are git tags of *other* repositories and do
 not line up with any `default_version` this extension ever declared. See
 `README.md` for provenance and for the versioning rule from `1.0.0` on.
 
+## 1.0.2
+Released 2026-08-14
+
+The git tag, `default_version`, base SQL script, and upgrade path all use the
+same version string. Existing 1.0.1 installations can upgrade in place with
+`ALTER EXTENSION odbc_fdw UPDATE TO '1.0.2'`; the intentionally empty upgrade
+script preserves dependent foreign tables and views because this release makes
+no extension-catalog changes.
+
+Added — compatibility evidence and test infrastructure:
+- the development image installs SHA-pinned SQLite 3.53.4, MySQL
+  Connector/ODBC 9.7.0, and Microsoft ODBC Driver 18.6.2.1 clients without
+  removing or replacing the existing ODBC drivers;
+- Compose provides isolated SQLite, MySQL 9.7.1, and SQL Server 2025 Express
+  integration targets; database images are digest-pinned and publish no host
+  ports;
+- live suites cover metadata import, direct type declarations, nulls, Unicode,
+  JSON where applicable, temporal and numeric values, binary and large values,
+  case-sensitive identifiers, bound parameters, query-backed tables, rescans,
+  read-only enforcement, and all resource ceilings;
+- the README records the remote-to-PostgreSQL type mappings actually exercised
+  by every maintained database suite, including driver-specific metadata gaps.
+
 ## 1.0.1
 Released 2026-08-14
 

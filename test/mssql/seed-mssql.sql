@@ -1,0 +1,86 @@
+DROP TABLE IF EXISTS dbo.ODBC_FDW_DATA_TYPES;
+DROP TABLE IF EXISTS dbo.ODBC_FDW_TYPE_MATRIX;
+DROP TABLE IF EXISTS dbo.ODBC_FDW_LARGE_VALUES;
+DROP TABLE IF EXISTS dbo.ODBC_FDW_SINGLE_ROW;
+DROP TABLE IF EXISTS dbo.ODBC_FDW_CASE_NAMES;
+
+CREATE TABLE dbo.ODBC_FDW_DATA_TYPES (
+    ID int PRIMARY KEY,
+    TEXT_VALUE varchar(100),
+    INTEGER_VALUE int,
+    DECIMAL_VALUE decimal(20,4),
+    DATE_VALUE date,
+    TIME_VALUE time(6),
+    TIMESTAMP_VALUE datetime2(6),
+    NULL_VALUE varchar(10),
+    UNICODE_VALUE nvarchar(100)
+);
+INSERT INTO dbo.ODBC_FDW_DATA_TYPES VALUES
+    (1, 'alpha', 42, 123.4500, '2024-01-02', '03:04:05.123456',
+     '2024-01-02T03:04:05.123456', NULL,
+     N'Gr' + NCHAR(0x00FC) + NCHAR(0x00DF) + N'e'),
+    (2, 'beta', -7, -0.0100, '2024-12-31', '23:59:59.654321',
+     '2024-12-31T23:59:59.654321', 'present',
+     NCHAR(0x6771) + NCHAR(0x4EAC));
+
+CREATE TABLE dbo.ODBC_FDW_TYPE_MATRIX (
+    ID int PRIMARY KEY,
+    TINY_VALUE tinyint,
+    SMALL_VALUE smallint,
+    INTEGER_VALUE int,
+    BIGINT_VALUE bigint,
+    DECIMAL_VALUE decimal(18,4),
+    REAL_VALUE real,
+    FLOAT_VALUE float(53),
+    BIT_VALUE bit,
+    CHAR_VALUE char(6),
+    NCHAR_VALUE nchar(6),
+    VARCHAR_VALUE varchar(100),
+    NVARCHAR_VALUE nvarchar(100),
+    TEXT_VALUE varchar(max),
+    NTEXT_VALUE nvarchar(max),
+    DATE_VALUE date,
+    TIME_VALUE time(6),
+    DATETIME_VALUE datetime2(6),
+    SMALLDATETIME_VALUE smalldatetime,
+    GUID_VALUE uniqueidentifier,
+    BINARY_VALUE binary(4),
+    VARBINARY_VALUE varbinary(4),
+    IMAGE_VALUE varbinary(max)
+);
+INSERT INTO dbo.ODBC_FDW_TYPE_MATRIX VALUES
+    (1, 255, -32768, 2147483647, 922337203685477580,
+     12345678901234.5678, 3.25, 1234567.125, 1,
+     'abc', NCHAR(0x6771) + NCHAR(0x4EAC), 'plain text',
+     N'Gr' + NCHAR(0x00FC) + NCHAR(0x00DF) + N'e ' +
+         NCHAR(0x6771) + NCHAR(0x4EAC),
+     REPLICATE('long ', 20),
+     N'long unicode ' + NCHAR(0x041F) + NCHAR(0x0440) + NCHAR(0x0438) +
+         NCHAR(0x0432) + NCHAR(0x0435) + NCHAR(0x0442) + N' ' +
+         NCHAR(0x6771) + NCHAR(0x4EAC),
+     '2024-06-30', '12:34:56.123456', '2024-06-30T12:34:56.123456',
+     '2024-06-30T12:35:00', '01234567-89ab-cdef-0123-456789abcdef',
+     0xABCD, 0x1020, 0x004142FF);
+INSERT INTO dbo.ODBC_FDW_TYPE_MATRIX VALUES
+    (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+CREATE TABLE dbo.ODBC_FDW_LARGE_VALUES (
+    ID int PRIMARY KEY,
+    TEXT_VALUE varchar(max),
+    BLOB_VALUE varbinary(max)
+);
+INSERT INTO dbo.ODBC_FDW_LARGE_VALUES VALUES
+    (1, REPLICATE(CAST('x' AS varchar(max)), 6000), 0x004142FF);
+
+CREATE TABLE dbo.ODBC_FDW_SINGLE_ROW (ID int PRIMARY KEY, PAYLOAD varchar(100));
+INSERT INTO dbo.ODBC_FDW_SINGLE_ROW VALUES (1, 'rescan');
+
+CREATE TABLE dbo.ODBC_FDW_CASE_NAMES (
+    UPPER_VALUE int,
+    lower_value varchar(100),
+    MixedValue nvarchar(100),
+    [Spaced Value] nvarchar(100)
+);
+INSERT INTO dbo.ODBC_FDW_CASE_NAMES VALUES
+    (1, 'lower column', N'mixed column', N'space column');

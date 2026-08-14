@@ -30,8 +30,9 @@ EXTENSION = odbc_fdw
 # works; for a C-only change an EMPTY upgrade script is the honest artefact,
 # because the alternative is DROP and CREATE, which CASCADEs a warehouse's
 # foreign tables away.
-DATA = odbc_fdw--1.0.1.sql \
-       odbc_fdw--1.0.0--1.0.1.sql
+DATA = sql/odbc_fdw--1.0.2.sql \
+       sql/odbc_fdw--1.0.0--1.0.1.sql \
+       sql/odbc_fdw--1.0.1--1.0.2.sql
 
 TEST_DIR = test/
 REGRESS = $(notdir $(basename $(sort $(wildcard $(TEST_DIR)/sql/*test.sql))))
@@ -44,7 +45,8 @@ override CFLAGS += -DDEBUG -g -O0
 endif
 
 DOCKER_GOALS = \
-	docker-build docker-shell docker-test docker-hana docker-hana-seed docker-hana-clean \
+	docker-build docker-shell docker-test docker-sqlite docker-mysql docker-mssql \
+	docker-hana docker-hana-seed docker-hana-clean \
 	docker-oracle docker-oracle-seed docker-oracle-clean \
 	docker-test-amd64 docker-test-arm64 docker-test-all \
 	docker-hana-amd64 docker-hana-arm64 docker-hana-all \
@@ -78,7 +80,8 @@ integration_tests:
 DOCKER_COMPOSE ?= docker compose
 
 .PHONY: \
-	docker-build docker-shell docker-test docker-hana docker-hana-seed docker-hana-clean \
+	docker-build docker-shell docker-test docker-sqlite docker-mysql docker-mssql \
+	docker-hana docker-hana-seed docker-hana-clean \
 	docker-oracle docker-oracle-seed docker-oracle-clean \
 	docker-test-amd64 docker-test-arm64 docker-test-all \
 	docker-hana-amd64 docker-hana-arm64 docker-hana-all \
@@ -99,6 +102,23 @@ docker-shell:
 docker-test:
 	$(DOCKER_COMPOSE) build test
 	$(DOCKER_COMPOSE) run --rm test
+
+docker-sqlite:
+	$(DOCKER_COMPOSE) build sqlite
+	$(DOCKER_COMPOSE) run --rm sqlite
+
+docker-mysql:
+	$(DOCKER_COMPOSE) build mysql
+	$(DOCKER_COMPOSE) up -d --wait mysql-db
+	$(DOCKER_COMPOSE) run --rm mysql
+
+# SQL Server 2025's Linux server image is amd64-only. The test runner and
+# Microsoft ODBC client remain native on both amd64 and arm64; Docker emulates
+# only the isolated Express database service on an arm64 development host.
+docker-mssql:
+	$(DOCKER_COMPOSE) build mssql
+	$(DOCKER_COMPOSE) up -d --wait mssql-db
+	$(DOCKER_COMPOSE) run --rm mssql
 
 # Explicit platforms make the non-native image testable through Docker's
 # emulation support. They are intentionally separate from docker-test, whose

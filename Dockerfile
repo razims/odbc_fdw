@@ -1,9 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
-# Pin the PostgreSQL base and both proprietary ODBC clients as build inputs.
-# Change a client version and all of its architecture-specific digests in the
-# same commit; credentials and database coordinates belong in .env, versions
-# never do.
+# Pin the PostgreSQL base and every downloaded client or build input. Change a
+# version and all of its architecture-specific digests in the same commit.
+# External database coordinates belong in .env; versions never do.
 ARG PG_IMAGE=postgres:18-trixie@sha256:d129b9577d274bb96cbd44d902bdeb1b935c89247d161241e9154cba64e13df4
 ARG HANA_CLIENT_VERSION=2.29.25
 ARG HANA_CLIENT_SHA256_AMD64=3836373eaa62c9461f6803f2102c9fd899439bad6329e10f71f32ec673c006b7
@@ -17,6 +16,15 @@ ARG ORACLE_CLIENT_DOWNLOAD_DIR=2123000
 ARG ORACLE_CLIENT_INSTALL_DIR=instantclient_21_23
 ARG ORACLE_BASIC_SHA256_AMD64=68a6ccd7ca6fbfb4d2914bd6531a8599fdb75841b8d47df5256bfef40d020820
 ARG ORACLE_ODBC_SHA256_AMD64=aec81a0e2660c1154690d7b1334255973072cc1a38b23134301a94091038a365
+ARG SQLITE_VERSION=3.53.4
+ARG SQLITE_RELEASE=3530400
+ARG SQLITE_SHA3_256=454e45f61c6bd75b7420e7190732dea03ce6639c63ada47bbc592f67fc340338
+ARG MYSQL_ODBC_VERSION=9.7.0
+ARG MYSQL_ODBC_SHA256_AMD64=bbdf2b349ed642d4dd5cf39f7cc05fcf39f7e99b318fc838eb3b29920a6eaf50
+ARG MYSQL_ODBC_SHA256_ARM64=8c15abaac3920da72d5ceef86a2eab9e8f4b3d5a44e201e00e5326dc54d81bd9
+ARG MSSQL_ODBC_VERSION=18.6.2.1-1
+ARG MSSQL_ODBC_SHA256_AMD64=11e26f96feb95a7ecf55544441fa24233fab0debe8901e0ca9715c19fea05ab0
+ARG MSSQL_ODBC_SHA256_ARM64=4a7094e9a620d2c2aaf735eec4683d28e9823e5f28e674f0d29f4ec8086e9c49
 
 FROM ${PG_IMAGE} AS dev
 
@@ -27,10 +35,93 @@ RUN apt-get update \
         build-essential \
         ca-certificates \
         curl \
+        libsqliteodbc \
         odbc-postgresql \
+        openssl \
         postgresql-server-dev-18 \
+        sqlite3 \
         unixodbc \
         unixodbc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build the current SQLite core while retaining Debian's portable SQLite ODBC
+# bridge. The bridge links to libsqlite3 dynamically, so both the CLI and ODBC
+# path exercise this SHA3-pinned core on amd64 and arm64.
+ARG SQLITE_VERSION
+ARG SQLITE_RELEASE
+ARG SQLITE_SHA3_256
+RUN curl --fail --silent --show-error --location \
+        --proto '=https' --proto-redir '=https' \
+        --output /tmp/sqlite.tar.gz \
+        "https://sqlite.org/2026/sqlite-autoconf-${SQLITE_RELEASE}.tar.gz" \
+    && test "$(openssl dgst -sha3-256 /tmp/sqlite.tar.gz | awk '{print $2}')" = "${SQLITE_SHA3_256}" \
+    && mkdir /tmp/sqlite-source \
+    && tar --no-same-owner --strip-components=1 -xzf /tmp/sqlite.tar.gz -C /tmp/sqlite-source \
+    && cd /tmp/sqlite-source \
+    && ./configure --prefix=/usr/local --disable-static \
+    && make -j"$(nproc)" \
+    && make install \
+    && ldconfig \
+    && sqlite3 --version | grep -F "${SQLITE_VERSION}" \
+    && odbcinst -q -d | grep -Fx '[SQLite3]' \
+    && rm -rf /tmp/sqlite.tar.gz /tmp/sqlite-source
+
+# Install the latest GA MySQL Connector/ODBC Unicode and ANSI drivers from
+# Oracle's generic glibc build. The official archives cover both Linux
+# architectures used by the development image.
+ARG TARGETARCH
+ARG MYSQL_ODBC_VERSION
+ARG MYSQL_ODBC_SHA256_AMD64
+ARG MYSQL_ODBC_SHA256_ARM64
+RUN case "${TARGETARCH}" in \
+        amd64) mysql_arch=x86-64bit; mysql_sha="${MYSQL_ODBC_SHA256_AMD64}" ;; \
+        arm64) mysql_arch=aarch64; mysql_sha="${MYSQL_ODBC_SHA256_ARM64}" ;; \
+        *) echo "No MySQL Connector/ODBC archive is pinned for TARGETARCH='${TARGETARCH}'." >&2; exit 1 ;; \
+    esac \
+    && mysql_archive="mysql-connector-odbc-${MYSQL_ODBC_VERSION}-linux-glibc2.28-${mysql_arch}" \
+    && curl --fail --silent --show-error --location \
+        --proto '=https' --proto-redir '=https' \
+        --output /tmp/mysql-odbc.tar.gz \
+        "https://cdn.mysql.com/Downloads/Connector-ODBC/9.7/${mysql_archive}.tar.gz" \
+    && echo "${mysql_sha}  /tmp/mysql-odbc.tar.gz" | sha256sum --check --strict - \
+    && tar --no-same-owner -xzf /tmp/mysql-odbc.tar.gz -C /tmp \
+    && install -d -m 0755 "/opt/mysql/connector-odbc-${MYSQL_ODBC_VERSION}/lib" \
+    && cp -a "/tmp/${mysql_archive}/lib/." "/opt/mysql/connector-odbc-${MYSQL_ODBC_VERSION}/lib/" \
+    && install -m 0555 "/tmp/${mysql_archive}/bin/myodbc-installer" /usr/local/bin/myodbc-installer \
+    && chown -R root:root "/opt/mysql/connector-odbc-${MYSQL_ODBC_VERSION}" \
+    && printf '%s\n' \
+        '[MySQL ODBC 9.7 Unicode Driver]' \
+        'Description = MySQL Connector/ODBC 9.7 Unicode driver' \
+        "Driver = /opt/mysql/connector-odbc-${MYSQL_ODBC_VERSION}/lib/libmyodbc9w.so" \
+        '[MySQL ODBC 9.7 ANSI Driver]' \
+        'Description = MySQL Connector/ODBC 9.7 ANSI driver' \
+        "Driver = /opt/mysql/connector-odbc-${MYSQL_ODBC_VERSION}/lib/libmyodbc9a.so" \
+        >> /etc/odbcinst.ini \
+    && test "$(ldd "/opt/mysql/connector-odbc-${MYSQL_ODBC_VERSION}/lib/libmyodbc9w.so" | grep -c 'not found')" -eq 0 \
+    && odbcinst -q -d | grep -Fx '[MySQL ODBC 9.7 Unicode Driver]' \
+    && rm -rf /tmp/mysql-odbc.tar.gz "/tmp/${mysql_archive}"
+
+# Microsoft's current ODBC 18 package is published natively for Debian 13 on
+# both amd64 and arm64. Download the exact package rather than adding a mutable
+# apt repository to the image, and verify the package index's SHA-256 digest.
+ARG MSSQL_ODBC_VERSION
+ARG MSSQL_ODBC_SHA256_AMD64
+ARG MSSQL_ODBC_SHA256_ARM64
+RUN case "${TARGETARCH}" in \
+        amd64) mssql_arch=amd64; mssql_sha="${MSSQL_ODBC_SHA256_AMD64}" ;; \
+        arm64) mssql_arch=arm64; mssql_sha="${MSSQL_ODBC_SHA256_ARM64}" ;; \
+        *) echo "No Microsoft ODBC package is pinned for TARGETARCH='${TARGETARCH}'." >&2; exit 1 ;; \
+    esac \
+    && mssql_deb="msodbcsql18_${MSSQL_ODBC_VERSION}_${mssql_arch}.deb" \
+    && curl --fail --silent --show-error --location \
+        --proto '=https' --proto-redir '=https' \
+        --output "/tmp/${mssql_deb}" \
+        "https://packages.microsoft.com/debian/13/prod/pool/main/m/msodbcsql18/${mssql_deb}" \
+    && echo "${mssql_sha}  /tmp/${mssql_deb}" | sha256sum --check --strict - \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends "/tmp/${mssql_deb}" \
+    && odbcinst -q -d | grep -Fx '[ODBC Driver 18 for SQL Server]' \
+    && rm -f "/tmp/${mssql_deb}" \
     && rm -rf /var/lib/apt/lists/*
 
 # `libodbcHDB.so` is loaded in the PostgreSQL backend, so the image fetches it
@@ -96,17 +187,26 @@ FROM dev AS test-runner
 # from the build context by .dockerignore.
 COPY Makefile odbc_fdw.control /workspace/
 COPY src/ /workspace/src/
-COPY odbc_fdw--*.sql /workspace/
+COPY sql/ /workspace/sql/
 COPY docker/ /workspace/docker/
+COPY test/common/ /workspace/test/common/
 COPY test/hana/ /workspace/test/hana/
+COPY test/mssql/ /workspace/test/mssql/
+COPY test/mysql/ /workspace/test/mysql/
 COPY test/oracle/ /workspace/test/oracle/
+COPY test/sqlite/ /workspace/test/sqlite/
 RUN cc -std=c11 -Wall -Wextra -Werror -O2 /workspace/test/hana/hana-exec.c \
         -lodbc -o /usr/local/bin/hana-exec \
     && cc -std=c11 -Wall -Wextra -Werror -O2 /workspace/test/oracle/oracle-exec.c \
         -lodbc -o /usr/local/bin/oracle-exec \
+    && cc -std=c11 -Wall -Wextra -Werror -O2 /workspace/test/common/odbc-exec.c \
+        -lodbc -o /usr/local/bin/odbc-exec \
     && chmod 0555 /usr/local/bin/hana-exec \
     && chmod 0555 /usr/local/bin/oracle-exec \
-    && chmod +x /workspace/docker/*.sh /workspace/test/hana/*.sh /workspace/test/oracle/*.sh
+    && chmod 0555 /usr/local/bin/odbc-exec \
+    && chmod +x /workspace/docker/*.sh /workspace/test/hana/*.sh \
+        /workspace/test/mssql/*.sh /workspace/test/mysql/*.sh \
+        /workspace/test/oracle/*.sh /workspace/test/sqlite/*.sh
 
 # Oracle does not publish Instant Client 21 for Linux ARM64. Keep the ordinary
 # and HANA test runners multi-architecture, and isolate Oracle in an amd64-only

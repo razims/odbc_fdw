@@ -13,7 +13,7 @@ other correctness fixes to the upstream lineage.
 | | |
 | --- | --- |
 | Extension | `odbc_fdw` |
-| Release | `1.0.1` |
+| Release | `1.0.2` |
 | PostgreSQL compatibility | PostgreSQL 9.5–18 |
 | Current build and test target | PostgreSQL 18 |
 | Runtime dependency | unixODBC plus an ODBC driver for the remote source |
@@ -29,7 +29,7 @@ verified with the exact driver version used in production.
 The source retains PostgreSQL API compatibility branches from 9.5 through 18.
 The current release suite runs on PostgreSQL 18. The predecessor project's CI
 historically exercised PostgreSQL 9.5 through 12; those results are inherited
-evidence, not a claim that this 1.0.1 tree has been rerun on every older major.
+evidence, not a claim that this 1.0.2 tree has been rerun on every older major.
 PostgreSQL 13 through 17 are covered by the compatibility code but are not yet
 part of the maintained test matrix.
 
@@ -40,6 +40,9 @@ This release has been tested against:
 | PostgreSQL 18 | psqlODBC from Debian 13 |
 | SAP HANA 2.0 | SAP HANA Client 2.29.25 |
 | Oracle Database 19c | Oracle Instant Client ODBC 21.23 |
+| SQLite 3.53.4 | SQLite ODBC 0.99991 |
+| MySQL 9.7.1 | MySQL Connector/ODBC 9.7.0 |
+| Microsoft SQL Server 2025 Express | Microsoft ODBC Driver 18.6.2.1 |
 
 This table records test evidence; it is not an allowlist. Other ODBC data
 sources may work without code changes.
@@ -292,7 +295,7 @@ The extension provides three SQL helpers:
 - `ODBCQuerySize(server_name, query)` returns a query row count.
 
 They open remote connections, and the query helper executes caller-supplied
-remote SQL. Fresh 1.0.1 installations revoke their execution privileges from
+remote SQL. Fresh installations revoke their execution privileges from
 `PUBLIC`. Grant both foreign-server usage and the required function explicitly:
 
 ```sql
@@ -300,10 +303,10 @@ GRANT USAGE ON FOREIGN SERVER remote_source TO metadata_reader;
 GRANT EXECUTE ON FUNCTION ODBCTablesList(text, integer) TO metadata_reader;
 ```
 
-Upgrade an existing 1.0.0 installation to apply the revised grants:
+Upgrade an existing installation to the current release:
 
 ```sql
-ALTER EXTENSION odbc_fdw UPDATE TO '1.0.1';
+ALTER EXTENSION odbc_fdw UPDATE TO '1.0.2';
 ```
 
 ## Type mapping
@@ -360,12 +363,58 @@ may emit modifier-preserving equivalents such as `char(n)`, `varchar(n)`, or
 | Oracle Database | `CHAR(6)`, `NCHAR(6)`, `VARCHAR2(100)`, `NVARCHAR2(100)`, `CLOB`, `NCLOB` | `text` |
 | Oracle Database | `DATE`, `TIMESTAMP(6)` | `timestamp` |
 | Oracle Database | `BLOB`, `RAW(4)` | `bytea` |
+| SQLite | `TINYINT`, `SMALLINT` | `smallint` |
+| SQLite | `INTEGER` | `integer` |
+| SQLite | `BIGINT` | `bigint` |
+| SQLite | `NUMERIC` | `numeric` when declared explicitly; `double precision` on import with SQLite ODBC 0.99991 |
+| SQLite | `REAL` | `real` |
+| SQLite | `DOUBLE` | `double precision` |
+| SQLite | `BOOLEAN` | `boolean` |
+| SQLite | `CHAR(6)`, `VARCHAR(100)`, `TEXT` | `text` |
+| SQLite | `DATE` | `date` |
+| SQLite | `TIME` | `time` |
+| SQLite | `TIMESTAMP` | `timestamp` |
+| SQLite | `BLOB` | `bytea` |
+| MySQL | `TINYINT`, `TINYINT UNSIGNED`, `SMALLINT` | `smallint` |
+| MySQL | `INT` | `integer` |
+| MySQL | `BIGINT` | `bigint` |
+| MySQL | `DECIMAL(18,4)`, `DECIMAL(20,4)` | `numeric` |
+| MySQL | `FLOAT` | `real` |
+| MySQL | `DOUBLE` | `double precision` |
+| MySQL | `BOOLEAN`, `BIT(1)` | `boolean` |
+| MySQL | `CHAR(6)`, `VARCHAR(100)`, `TEXT`, `LONGTEXT` | `text` |
+| MySQL | `DATE` | `date` |
+| MySQL | `TIME(6)` | `time` |
+| MySQL | `DATETIME(6)`, `TIMESTAMP(6)` | `timestamp` |
+| MySQL | `YEAR` | `smallint` |
+| MySQL | `BINARY(4)`, `VARBINARY(4)`, `BLOB`, `LONGBLOB` | `bytea` |
+| MySQL | `JSON` | `jsonb` in an explicit foreign-table declaration |
+| Microsoft SQL Server | `TINYINT`, `SMALLINT` | `smallint` |
+| Microsoft SQL Server | `INT` | `integer` |
+| Microsoft SQL Server | `BIGINT` | `bigint` |
+| Microsoft SQL Server | `DECIMAL(18,4)`, `DECIMAL(20,4)` | `numeric` |
+| Microsoft SQL Server | `REAL` | `real` |
+| Microsoft SQL Server | `FLOAT(53)` | `double precision` |
+| Microsoft SQL Server | `BIT` | `boolean` |
+| Microsoft SQL Server | `CHAR(6)`, `NCHAR(6)`, `VARCHAR(100)`, `NVARCHAR(100)`, `VARCHAR(MAX)`, `NVARCHAR(MAX)` | `text` |
+| Microsoft SQL Server | `DATE` | `date` |
+| Microsoft SQL Server | `TIME(6)` | `time` in an explicit foreign-table declaration |
+| Microsoft SQL Server | `DATETIME2(6)`, `SMALLDATETIME` | `timestamp` |
+| Microsoft SQL Server | `UNIQUEIDENTIFIER` | `uuid` |
+| Microsoft SQL Server | `BINARY(4)`, `VARBINARY(4)`, `VARBINARY(MAX)` | `bytea` |
 
 The national-character Oracle cases were exercised with
 `wide_char_mode 'wchar'`. A missing type in this table means that the current
 fixtures do not cover it; it does not mean that the type or database is
 unsupported. Numeric mappings demonstrate the seeded precisions and values,
 not every value in each remote type's full domain.
+
+SQLite's dynamic type system and the SQLite ODBC bridge's metadata explain the
+different `NUMERIC` import result recorded above. Microsoft ODBC Driver 18
+reports SQL Server `TIME` metadata as the vendor-specific type `-154`; the
+current generic importer omits that column with a `NOTICE`, while an explicit
+`time` declaration is covered by the scan suite. These measured exceptions are
+kept visible rather than presented as portable generic mappings.
 
 Unsupported metadata types are reported with a `NOTICE` and omitted from the
 generated table definition. A hand-written foreign table may use PostgreSQL's
@@ -403,6 +452,9 @@ Docker is the supported development environment:
 make docker-build
 make docker-shell
 make docker-test
+make docker-sqlite
+make docker-mysql
+make docker-mssql
 ```
 
 `make docker-test` compiles and installs the extension, starts disposable local
@@ -410,6 +462,15 @@ PostgreSQL databases, and reaches one through a real ODBC driver. It covers
 extension loading, imports, scans, identifier mapping, parameter binding,
 binary values, rescans, resource ceilings, error cleanup, and a repeated
 1,000,000-row transfer with row-count, checksum, and backend-memory checks.
+
+The SQLite, MySQL, and SQL Server targets build the same test runner and execute
+live ODBC suites against isolated Compose services. They need no credentials
+and cover explicit declarations, metadata import, nulls, Unicode, numeric and
+temporal values, large text and binary values, identifier case, bound
+parameters, query-backed tables, rescans, read-only enforcement, and resource
+ceilings. The SQL Server database image is amd64-only; on an arm64 host Docker
+emulates that database container while the test runner and Microsoft ODBC
+client remain native.
 
 Architecture-specific variants are available:
 
@@ -419,8 +480,8 @@ make docker-test-arm64
 make docker-test-all
 ```
 
-Additional live-database integration suites are kept under `test/`. They are
-opt-in because they require external databases and credentials from the
+Additional live-database integration suites are kept under `test/`. Suites for
+external databases are opt-in because they require credentials from the
 gitignored `.env` file. Their seed and cleanup commands modify only dedicated
 `ODBC_FDW_*` fixtures. See `.env.example`, the Makefile targets, and the test
 scripts for operational details.
@@ -432,7 +493,7 @@ credential-free development gate.
 ## Versioning
 
 The annotated git tag, `default_version`, base SQL filename, Makefile `DATA`,
-and upgrade path use the same version. This release is `1.0.1`.
+and upgrade path use the same version. This release is `1.0.2`.
 
 Every release changes that version:
 

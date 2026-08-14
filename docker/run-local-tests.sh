@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 readonly pg_bin="$(dirname "${PG_CONFIG}")"
+readonly extension_dir="$("${PG_CONFIG}" --sharedir)/extension"
 readonly test_root="$(mktemp -d)"
 readonly pgdata="${test_root}/data"
 readonly socket_dir="${test_root}/socket"
@@ -26,9 +27,8 @@ psql_local() {
 }
 
 mkdir -p "${source_dir}"
-cp -a /workspace/Makefile /workspace/odbc_fdw.control \
-    /workspace/odbc_fdw--*.sql "${source_dir}/"
-cp -a /workspace/src "${source_dir}/src"
+cp -a /workspace/Makefile /workspace/odbc_fdw.control "${source_dir}/"
+cp -a /workspace/src /workspace/sql "${source_dir}/"
 make -C "${source_dir}" clean
 make -C "${source_dir}" USE_PGXS=1 PG_CONFIG="${PG_CONFIG}"
 make -C "${source_dir}" install USE_PGXS=1 PG_CONFIG="${PG_CONFIG}"
@@ -47,7 +47,25 @@ runuser -u postgres -- "${pg_bin}/pg_ctl" -D "${pgdata}" \
 psql_local postgres <<'SQL'
 CREATE DATABASE remotedb;
 CREATE DATABASE fdwtest;
+CREATE DATABASE upgradetest;
 SQL
+
+# Exercise the packaged 1.0.1 -> 1.0.2 edge against an actual installed 1.0.1
+# extension. The prior base script is staged only long enough to create that
+# disposable starting state; the ALTER itself must succeed with only the new
+# upgrade script installed, as it would on an operator's existing database.
+install -m 0644 "${source_dir}/sql/odbc_fdw--1.0.2.sql" \
+    "${extension_dir}/odbc_fdw--1.0.1.sql"
+psql_local upgradetest <<'SQL'
+CREATE EXTENSION odbc_fdw VERSION '1.0.1';
+CREATE SERVER upgrade_dependency FOREIGN DATA WRAPPER odbc_fdw;
+SQL
+rm -f "${extension_dir}/odbc_fdw--1.0.1.sql"
+psql_local upgradetest -c "ALTER EXTENSION odbc_fdw UPDATE TO '1.0.2'" >/dev/null
+[[ "$(psql_local upgradetest -Atqc "SELECT extversion FROM pg_extension WHERE extname = 'odbc_fdw'")" == '1.0.2' ]] \
+    || fail 'the 1.0.1 -> 1.0.2 upgrade did not advance pg_extension.extversion'
+[[ "$(psql_local upgradetest -Atqc "SELECT count(*) FROM pg_foreign_server WHERE srvname = 'upgrade_dependency'")" == '1' ]] \
+    || fail 'the 1.0.1 -> 1.0.2 upgrade dropped a dependent foreign server'
 
 psql_local remotedb <<'SQL'
 CREATE TABLE public.small (
@@ -115,6 +133,9 @@ CREATE ROLE driver_attacker;
 GRANT USAGE ON FOREIGN SERVER loopback TO driver_attacker;
 CREATE ROLE helper_attacker;
 SQL
+
+[[ "$(psql_local fdwtest -Atqc "SELECT extversion FROM pg_extension WHERE extname = 'odbc_fdw'")" == '1.0.2' ]] \
+    || fail 'CREATE EXTENSION did not select default version 1.0.2'
 
 [[ "$(psql_local fdwtest -Atqc 'SELECT string_agg(label, chr(44) ORDER BY id) FROM ext.small')" == 'first,second' ]] \
     || fail 'the loopback ODBC scan returned unexpected values'

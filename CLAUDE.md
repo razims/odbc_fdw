@@ -228,12 +228,17 @@ make docker-build
 make docker-shell
 make docker-test
 make docker-test-all
+make docker-sqlite
+make docker-mysql
+make docker-mssql
 ```
 
-The credential-free suite builds and installs the extension, starts disposable
-local databases, and reaches one through a real ODBC driver. It covers loading,
-imports, scans, identifier mapping, binary values, bound parameters, limits,
-rescans, cancellation, handle cleanup, and a repeated 1,000,000-row transfer.
+The credential-free suites build and install the extension, start disposable
+local databases, and reach them through real ODBC drivers. They cover loading,
+imports, scans, identifier mapping, binary values, Unicode, bound parameters,
+limits, rescans, cancellation, handle cleanup, and a repeated 1,000,000-row
+transfer. Keep their database images and downloaded clients pinned to exact
+versions and verified digests.
 
 Additional integration suites use external databases. They are opt-in, read
 credentials only from the gitignored `.env`, and operate only on dedicated
