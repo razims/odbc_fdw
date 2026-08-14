@@ -195,6 +195,18 @@ CREATE FOREIGN TABLE probe.float_matrix_text (
     schema :'hana_schema', table 'ODBC_FDW_FLOAT_MATRIX',
     id 'ID', dbl 'DBL', rl 'RL'
 );
+CREATE FOREIGN TABLE probe.wide_decimal (
+    id integer, d38_2 numeric(38,2), d38_0 numeric(38,0), d18_4 numeric(18,4)
+) SERVER hana OPTIONS (
+    schema :'hana_schema', table 'ODBC_FDW_WIDE_DECIMAL',
+    id 'ID', d38_2 'D38_2', d38_0 'D38_0', d18_4 'D18_4'
+);
+CREATE FOREIGN TABLE probe.wide_decimal_text (
+    id integer, d38_2 text, d38_0 text, d18_4 text
+) SERVER hana OPTIONS (
+    schema :'hana_schema', table 'ODBC_FDW_WIDE_DECIMAL',
+    id 'ID', d38_2 'D38_2', d38_0 'D38_0', d18_4 'D18_4'
+);
 CREATE SCHEMA imported_case;
 IMPORT FOREIGN SCHEMA :"hana_schema" LIMIT TO ("odbc_fdw_lower_table", "OdbcFdwMixedTable")
     FROM SERVER hana INTO imported_case;
@@ -214,6 +226,15 @@ SELECT 'direct_time=' || CASE WHEN
 SELECT 'direct_timestamp=' || CASE WHEN
     (SELECT timestamp_value FROM probe.direct_types WHERE id = 1) = TIMESTAMP '2024-01-02 03:04:05' AND
     (SELECT timestamp_value FROM probe.direct_types WHERE id = 2) = TIMESTAMP '2024-12-31 23:59:59'
+    THEN 'ok' ELSE 'bad' END;
+
+SELECT 'wide_decimal=' || CASE WHEN
+    (SELECT d38_2 FROM probe.wide_decimal_text WHERE id = 1) = '999999999999999999999999999999999999.99' AND
+    (SELECT d38_2 FROM probe.wide_decimal_text WHERE id = 2) = '-999999999999999999999999999999999999.99' AND
+    (SELECT d38_0 FROM probe.wide_decimal_text WHERE id = 2) = '-99999999999999999999999999999999999999' AND
+    (SELECT d18_4 FROM probe.wide_decimal_text WHERE id = 2) = '-12345678901234.5678' AND
+    (SELECT d38_2 FROM probe.wide_decimal WHERE id = 2) = -999999999999999999999999999999999999.99 AND
+    (SELECT d38_0 FROM probe.wide_decimal WHERE id = 2) = -99999999999999999999999999999999999999
     THEN 'ok' ELSE 'bad' END;
 
 SELECT 'float_roundtrip=' || CASE WHEN
