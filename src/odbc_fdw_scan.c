@@ -863,6 +863,14 @@ odbcIterateForeignScan(ForeignScanState *node)
 				 */
 				conversion = WIDE_TEXT_CONVERSION;
 			}
+			else if (DataTypePtr == SQL_DOUBLE || DataTypePtr == SQL_FLOAT)
+			{
+				conversion = FLOAT8_CONVERSION;
+			}
+			else if (DataTypePtr == SQL_REAL)
+			{
+				conversion = FLOAT4_CONVERSION;
+			}
 			else if (strcmp("boolean", (char*)sql_type.data) == 0)
 			{
 				conversion = BOOL_CONVERSION;
@@ -1001,6 +1009,13 @@ odbcIterateForeignScan(ForeignScanState *node)
 			bool binary_data = false;
 			bool wide_data = false;
 			/*
+			 * A fixed-width binary target: the driver writes the value's own
+			 * representation rather than text, so there is no terminator, no
+			 * chunking, and the byte-scan that trims a C string must not run
+			 * over it -- a double's bytes routinely contain zeros.
+			 */
+			bool fixed_width = false;
+			/*
 			 * How many bytes the driver said this value measures, or -1 while
 			 * it has not said. Set from the length reported alongside a
 			 * truncation, and checked once the read has finished; see the test
@@ -1018,6 +1033,20 @@ odbcIterateForeignScan(ForeignScanState *node)
 				terminator_size = sizeof(SQLWCHAR);
 				wide_data = true;
 			}
+			else if (conversion == FLOAT8_CONVERSION)
+			{
+				target_type = SQL_C_DOUBLE;
+				terminator_size = 0;
+				fixed_width = true;
+				col_size = sizeof(double);
+			}
+			else if (conversion == FLOAT4_CONVERSION)
+			{
+				target_type = SQL_C_FLOAT;
+				terminator_size = 0;
+				fixed_width = true;
+				col_size = sizeof(float);
+			}
 
 			if (col_size == 0)
 			{
@@ -1032,8 +1061,10 @@ odbcIterateForeignScan(ForeignScanState *node)
 					         errmsg("odbc_fdw: wide-character column is too large to buffer")));
 				chunk_size = (col_size + 1) * sizeof(SQLWCHAR);
 			}
+			else if (fixed_width || binary_data)
+				chunk_size = col_size;
 			else
-				chunk_size = binary_data ? col_size : col_size + 1;
+				chunk_size = col_size + 1;
 
 			/* Ignore this column if position is marked as invalid */
 			if (mapped_pos == -1)
@@ -1347,7 +1378,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 				                   expected_field_bytes, used_buffer_size),
 				         errhint("The driver did not continue a truncated read for this column's type. The truncated value is refused rather than returned.")));
 
-			if (!binary_data && !wide_data)
+			if (!binary_data && !wide_data && !fixed_width)
 			{
 				used_buffer_size = odbc_bounded_strlen(buffer,
 				                                       used_buffer_size);
@@ -1410,7 +1441,8 @@ odbcIterateForeignScan(ForeignScanState *node)
 						buffer = converted;
 						used_buffer_size = strlen(buffer);
 					}
-					else if (festate->encoding != -1 && !binary_data)
+					else if (festate->encoding != -1 && !binary_data &&
+					         !fixed_width)
 					{
 						/* Convert character encoding */
 						buffer = pg_any_to_server(buffer, used_buffer_size, festate->encoding);
@@ -1428,6 +1460,62 @@ odbcIterateForeignScan(ForeignScanState *node)
 						else if (buffer[0] == 1)
 							strcpy(buffer, "T");
 						appendStringInfoString (&col_data, buffer);
+						break;
+					case FLOAT8_CONVERSION :
+					case FLOAT4_CONVERSION :
+						{
+							/*
+							 * Render the value with PostgreSQL's own float
+							 * output, which is the same code that prints a
+							 * float8 or float4 anywhere else in the server:
+							 * shortest round-trip since PostgreSQL 12, and
+							 * honouring extra_float_digits before that. Nothing
+							 * here formats a float by hand.
+							 *
+							 * The alternative -- which this replaces -- was to
+							 * let the DRIVER render the value to text and parse
+							 * that. What a driver chooses is neither the
+							 * value's shortest round-trip form nor necessarily
+							 * capable of representing it: the SAP HANA client
+							 * renders 15 significant digits, so
+							 * 0.12345678901234566 came back
+							 * 0.1234567890123456, a DIFFERENT double, and
+							 * DBL_MAX came back 1.79769313486232E+308, which
+							 * PostgreSQL then refuses as out of range for
+							 * double precision. Retrieving the binary value and
+							 * formatting it here removes the driver's rendering
+							 * from the path entirely.
+							 *
+							 * float4 is kept separate rather than widened to
+							 * float8: widening 0.1f and printing it as a double
+							 * yields 0.10000000149011612, which round-trips but
+							 * is not what PostgreSQL prints for a real.
+							 */
+							double  float8_value;
+							float   float4_value;
+							char   *rendered;
+
+							if (used_buffer_size != (int) col_size)
+								ereport(ERROR,
+								        (errcode(ERRCODE_FDW_ERROR),
+								         errmsg("odbc_fdw: ODBC driver returned %d bytes for a %d-byte floating point column %d",
+								                used_buffer_size, (int) col_size,
+								                (int) i)));
+							if (conversion == FLOAT8_CONVERSION)
+							{
+								memcpy(&float8_value, buffer, sizeof(double));
+								rendered = DatumGetCString(DirectFunctionCall1(
+								    float8out, Float8GetDatum(float8_value)));
+							}
+							else
+							{
+								memcpy(&float4_value, buffer, sizeof(float));
+								rendered = DatumGetCString(DirectFunctionCall1(
+								    float4out, Float4GetDatum(float4_value)));
+							}
+							appendStringInfoString(&col_data, rendered);
+							pfree(rendered);
+						}
 						break;
 					case BIN_CONVERSION :
 						/* TODO: avoid hex conversion by building the tuple from Datum values instead of using BuildTupleFromCStrings */

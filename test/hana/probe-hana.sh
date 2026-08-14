@@ -88,6 +88,7 @@ assertions=(
     type_matrix type_matrix_nulls import_type_matrix import_binary
     ascii_text cyrillic_text utf8_text json_direct json_import json_nulls
     direct_case_names import_case_names sql_query parameter_in_out large_value
+    float_roundtrip float_text
     rescan
 )
 

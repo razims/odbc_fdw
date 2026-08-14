@@ -183,6 +183,18 @@ CREATE SCHEMA imported;
 IMPORT FOREIGN SCHEMA :"hana_schema" LIMIT TO ("ODBC_FDW_DATA_TYPES", "ODBC_FDW_TYPE_MATRIX", "ODBC_FDW_ENCODING_MATRIX", "ODBC_FDW_JSON_VALUES")
     FROM SERVER hana INTO imported;
 
+CREATE FOREIGN TABLE probe.float_matrix (
+    id integer, dbl double precision, rl real
+) SERVER hana OPTIONS (
+    schema :'hana_schema', table 'ODBC_FDW_FLOAT_MATRIX',
+    id 'ID', dbl 'DBL', rl 'RL'
+);
+CREATE FOREIGN TABLE probe.float_matrix_text (
+    id integer, dbl text, rl text
+) SERVER hana OPTIONS (
+    schema :'hana_schema', table 'ODBC_FDW_FLOAT_MATRIX',
+    id 'ID', dbl 'DBL', rl 'RL'
+);
 CREATE SCHEMA imported_case;
 IMPORT FOREIGN SCHEMA :"hana_schema" LIMIT TO ("odbc_fdw_lower_table", "OdbcFdwMixedTable")
     FROM SERVER hana INTO imported_case;
@@ -202,6 +214,23 @@ SELECT 'direct_time=' || CASE WHEN
 SELECT 'direct_timestamp=' || CASE WHEN
     (SELECT timestamp_value FROM probe.direct_types WHERE id = 1) = TIMESTAMP '2024-01-02 03:04:05' AND
     (SELECT timestamp_value FROM probe.direct_types WHERE id = 2) = TIMESTAMP '2024-12-31 23:59:59'
+    THEN 'ok' ELSE 'bad' END;
+
+SELECT 'float_roundtrip=' || CASE WHEN
+    (SELECT dbl FROM probe.float_matrix WHERE id = 1) = double precision '0.12345678901234566' AND
+    (SELECT dbl FROM probe.float_matrix WHERE id = 2) = double precision '1.7976931348623157e308' AND
+    (SELECT dbl FROM probe.float_matrix WHERE id = 3) = double precision '-1.7976931348623157e308' AND
+    (SELECT dbl FROM probe.float_matrix WHERE id = 4) = double precision '2.2250738585072014e-308' AND
+    (SELECT rl FROM probe.float_matrix WHERE id = 1) = real '3.25' AND
+    (SELECT rl IS NULL FROM probe.float_matrix WHERE id = 2) AND
+    (SELECT rl IS NULL FROM probe.float_matrix WHERE id = 3) AND
+    (SELECT rl IS NULL FROM probe.float_matrix WHERE id = 4)
+    THEN 'ok' ELSE 'bad' END;
+
+SELECT 'float_text=' || CASE WHEN
+    (SELECT dbl FROM probe.float_matrix_text WHERE id = 1) = '0.12345678901234566' AND
+    (SELECT dbl FROM probe.float_matrix_text WHERE id = 2) = '1.7976931348623157e+308' AND
+    (SELECT rl FROM probe.float_matrix_text WHERE id = 1) = '3.25'
     THEN 'ok' ELSE 'bad' END;
 
 SELECT 'direct_unicode_null=' || CASE WHEN

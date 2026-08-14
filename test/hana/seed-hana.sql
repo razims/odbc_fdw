@@ -1,3 +1,4 @@
+DROP TABLE "@SCHEMA@"."ODBC_FDW_FLOAT_MATRIX";
 DROP TABLE "@SCHEMA@"."ODBC_FDW_DATA_TYPES";
 DROP TABLE "@SCHEMA@"."ODBC_FDW_LARGE_VALUES";
 DROP TABLE "@SCHEMA@"."ODBC_FDW_SINGLE_ROW";
@@ -123,3 +124,23 @@ CREATE COLUMN TABLE "@SCHEMA@"."OdbcFdwMixedTable" (
 
 INSERT INTO "@SCHEMA@"."OdbcFdwMixedTable" VALUES
     (2, 'lower mixed table', 'mixed mixed table', 'space mixed table');
+
+-- Values that a driver's own TEXT rendering cannot carry, which is what the
+-- scan used to depend on. The SAP client renders DOUBLE with 15 significant
+-- digits, so the 17-digit value below came back as a DIFFERENT double and
+-- DBL_MAX came back 1.79769313486232E+308 -- larger than DBL_MAX, which
+-- PostgreSQL rejects as out of range. Both are exact once the binary value is
+-- retrieved and formatted by PostgreSQL's own float output.
+CREATE COLUMN TABLE "@SCHEMA@"."ODBC_FDW_FLOAT_MATRIX" (
+    "ID"          INTEGER PRIMARY KEY,
+    "DBL"         DOUBLE,
+    "RL"          REAL
+);
+INSERT INTO "@SCHEMA@"."ODBC_FDW_FLOAT_MATRIX" VALUES
+    (1, 0.12345678901234566, 3.25);
+INSERT INTO "@SCHEMA@"."ODBC_FDW_FLOAT_MATRIX" VALUES
+    (2, 1.7976931348623157E308, NULL);
+INSERT INTO "@SCHEMA@"."ODBC_FDW_FLOAT_MATRIX" VALUES
+    (3, -1.7976931348623157E308, NULL);
+INSERT INTO "@SCHEMA@"."ODBC_FDW_FLOAT_MATRIX" VALUES
+    (4, 2.2250738585072014E-308, NULL);
