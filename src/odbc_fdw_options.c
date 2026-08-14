@@ -70,6 +70,27 @@ void
 init_odbcFdwOptions(odbcFdwOptions* options)
 {
 	memset(options, 0, sizeof(odbcFdwOptions));
+
+	/*
+	 * Narrow retrieval stays the default, and this is a MEASURED choice rather
+	 * than an inherited one.
+	 *
+	 * SQL_C_WCHAR is the C type ODBC pairs with SQL_WCHAR, SQL_WVARCHAR and
+	 * SQL_WLONGVARCHAR, so defaulting to it looks like the obviously correct
+	 * pairing. It is not safe to assume. Asked for a wide target, the SAP HANA
+	 * client returns its UTF-8 bytes zero-extended into SQLWCHAR units rather
+	 * than UTF-16, so every byte becomes a code point and the value arrives
+	 * DOUBLE ENCODED -- 'Grueszlige' as 11 bytes instead of 7 -- with no
+	 * diagnostic of any kind. The same rows through SQL_C_CHAR are byte-exact.
+	 *
+	 * That is the failure this option exists for and why it cannot be probed:
+	 * a driver returning corrupted text instead of an error is indistinguishable
+	 * from one returning the truth. Whichever target is chosen is wrong for
+	 * some driver, so the default is the one that changes nothing for existing
+	 * installations, and wide_char_mode 'wchar' selects the other on a server
+	 * or on one foreign table.
+	 */
+	options->use_wide_char = false;
 }
 
 void

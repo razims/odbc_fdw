@@ -25,7 +25,7 @@ fi
 
 assertions=(
     direct_scalar direct_temporal direct_unicode_null import_types type_matrix
-    type_matrix_nulls import_type_matrix case_names sql_query wide_decimal wide_decimal_scale0 parameter_in_out
+    type_matrix_nulls import_type_matrix case_names sql_query wide_decimal wide_decimal_scale0 scripts parameter_in_out
     large_value rescan
 )
 for assertion in "${assertions[@]}"; do

@@ -119,6 +119,53 @@ name. It does not define the separator between a schema and a table. Every
 generated schema-qualified table name uses SQL's period, through the shared
 qualification helper, so scans and metadata queries cannot disagree.
 
+### Column buffers are sized from display size, not column size
+
+`SQLDescribeCol`'s column size answers a different question from the one a text
+retrieval asks. For `SQL_DECIMAL` and `SQL_NUMERIC` it is the PRECISION, which
+budgets digits only, while the rendering also needs a character for a sign and
+one for a decimal point. Sizing from it alone returned a value correctly only
+while its rendering was at most `max(precision, 32)` characters.
+
+Raise the buffer to `SQL_DESC_DISPLAY_SIZE`, as a LOWER BOUND only: an
+unsupported attribute, `SQL_NO_TOTAL`, or a value that cannot be a length must
+leave the existing sizing untouched. Nothing about consulting it may make a
+buffer smaller than it would otherwise have been.
+
+Sizing is the prevention, not the guarantee. ODBC guarantees a value can be
+retrieved across several `SQLGetData` calls only for character and binary source
+types, so for every other type the first call is the only one a driver need
+honour, and a driver that under-reports its own display size will still
+truncate. Therefore: when the driver has reported a length and fewer bytes than
+that arrive, REFUSE. Do not return the short value and do not attempt to repair
+it — the lost digits are unrecoverable, and `numeric(p,s)` pads a short
+rendering back to scale with zeros, so the wrong amount is indistinguishable
+from a right one. The same applies to fractional truncation (`01S07`) on a
+numeric type; the temporal half of that diagnostic stays tolerant because
+PostgreSQL's own temporal types round to microseconds regardless.
+
+Temporal floors carry a FULL sub-second fraction rather than trusting the
+reported size. ODBC caps fractional seconds precision at 9, so the widest
+renderings are 18 characters for a time and 29 for a timestamp, and those are
+the floors. SAP HANA reports a column size AND a display size of 27 for
+`TIMESTAMP` and then renders 29 bytes, so a buffer sized from what it reported
+truncated on the only `SQLGetData` call it would answer.
+
+Floating point columns do not go through text at all. `SQL_REAL`, `SQL_FLOAT`
+and `SQL_DOUBLE` are retrieved as `SQL_C_FLOAT`/`SQL_C_DOUBLE` and rendered with
+PostgreSQL's own `float4out`/`float8out`, because a driver's text rendering is
+not required to round-trip: SAP HANA renders 15 significant digits, losing the
+17th digit of a full-precision double and rendering `DBL_MAX` as a value larger
+than `DBL_MAX` that PostgreSQL rejects. Keep `float4` separate from `float8`;
+widening a real to a double prints `0.10000000149011612` where PostgreSQL
+prints `0.1`. Never format a float by hand here.
+
+Measured: Microsoft ODBC Driver 18 reproduces the silent decimal loss on
+`DECIMAL(38,2)`, and so does SAP HANA. psqlODBC and MySQL Connector/ODBC
+undersize identically and lose nothing only because they honour the
+continuation call, so a suite passing on those two proves nothing about the
+sizing.
+
 ### Driver lengths are indicators
 
 An `SQLGetData` result length may instead be `SQL_NULL_DATA` or `SQL_NO_TOTAL`.
@@ -135,11 +182,24 @@ large-value assembly quadratic.
 ### Wide text is driver-sensitive
 
 Some ODBC drivers require national character types to be retrieved through
-`SQL_C_WCHAR`; others already transcode those types correctly through
-`SQL_C_CHAR` and return incorrect data through the wide target without an
+`SQL_C_WCHAR`; others return INCORRECT DATA through the wide target without an
 error. Keep this product-neutral: `wide_char_mode` selects the behavior on the
 foreign server or table, defaults to `char`, and must never be inferred from a
 database or driver product name. A table value wins over its server value.
+
+DO NOT change the default to `wchar`, and do not probe or fall back
+automatically. This was tried and reverted on measurement. `SQL_C_WCHAR` is the
+C type ODBC pairs with the wide SQL types, so defaulting to it looks obviously
+correct, and it is byte-identical on MySQL Connector/ODBC and Microsoft ODBC
+Driver 18 while psqlODBC and SQLite ODBC report no wide types at all — four
+drivers giving no reason not to. The SAP HANA client then returns its UTF-8
+bytes zero-extended into `SQLWCHAR` units rather than UTF-16, so every byte
+becomes a code point and the value arrives double encoded, silently: `Grüße` as
+11 bytes rather than 7, byte-exact through `SQL_C_CHAR` in the same scan.
+
+That is the whole argument for the option existing. A driver returning
+corrupted text instead of an error cannot be distinguished from one returning
+the truth, so no amount of evidence from other drivers licenses a default.
 
 The wide path accepts aligned 2-byte UTF-16 or 4-byte UTF-32 `SQLWCHAR` units,
 validates code points and surrogate pairs, converts them to UTF-8, and then

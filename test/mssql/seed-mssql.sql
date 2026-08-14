@@ -1,5 +1,6 @@
 DROP TABLE IF EXISTS dbo.ODBC_FDW_WIDE_DECIMAL;
 DROP TABLE IF EXISTS dbo.ODBC_FDW_WIDE_DECIMAL_S0;
+DROP TABLE IF EXISTS dbo.ODBC_FDW_SCRIPTS;
 DROP TABLE IF EXISTS dbo.ODBC_FDW_DATA_TYPES;
 DROP TABLE IF EXISTS dbo.ODBC_FDW_TYPE_MATRIX;
 DROP TABLE IF EXISTS dbo.ODBC_FDW_LARGE_VALUES;
@@ -117,3 +118,39 @@ CREATE TABLE dbo.ODBC_FDW_CASE_NAMES (
 );
 INSERT INTO dbo.ODBC_FDW_CASE_NAMES VALUES
     (1, 'lower column', N'mixed column', N'space column');
+
+-- Scripts this distribution is expected to carry, every literal built from code
+-- units server-side: the seed executor uses the ANSI ODBC entry point, so a
+-- non-ASCII literal written directly in this file would be stored double
+-- encoded and the fixture rather than the read path would be what is measured.
+--
+-- Chosen to exercise the parts of wide retrieval that differ from each other:
+-- two-byte UTF-16 across several scripts, a SURROGATE PAIR for the
+-- supplementary plane, and a COMBINING mark, which is two code points that must
+-- not be reordered or coalesced.
+CREATE TABLE dbo.ODBC_FDW_SCRIPTS (
+    ID int PRIMARY KEY,
+    SCRIPT_NAME varchar(32),
+    VALUE nvarchar(100)
+);
+INSERT INTO dbo.ODBC_FDW_SCRIPTS VALUES
+    -- Privet (Cyrillic)
+    (1, 'cyrillic',
+     NCHAR(0x041F) + NCHAR(0x0440) + NCHAR(0x0438) + NCHAR(0x0432) +
+     NCHAR(0x0435) + NCHAR(0x0442)),
+    -- Beijing (Han)
+    (2, 'han', NCHAR(0x5317) + NCHAR(0x4EAC)),
+    -- U+1F600 and U+1D11E, each a surrogate pair in UTF-16
+    (3, 'supplementary',
+     NCHAR(0xD83D) + NCHAR(0xDE00) + NCHAR(0xD834) + NCHAR(0xDD1E)),
+    -- Selam (Ethiopic, used for Amharic)
+    (4, 'ethiopic',
+     NCHAR(0x1230) + NCHAR(0x120B) + NCHAR(0x121D)),
+    -- Yoruba: precomposed E-with-dot-below plus a COMBINING grave accent
+    (5, 'yoruba',
+     NCHAR(0x1EB8) + N' k' + NCHAR(0x00E1) + NCHAR(0x00E0) + N'b' +
+     NCHAR(0x1ECD) + NCHAR(0x0300)),
+    -- N'Ko, a right-to-left African script
+    (6, 'nko', NCHAR(0x07D2) + NCHAR(0x07DE) + NCHAR(0x07CF)),
+    -- Tifinagh, used for Amazigh
+    (7, 'tifinagh', NCHAR(0x2D5C) + NCHAR(0x2D30) + NCHAR(0x2D62));

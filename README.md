@@ -409,6 +409,15 @@ fixtures do not cover it; it does not mean that the type or database is
 unsupported. Numeric mappings demonstrate the seeded precisions and values,
 not every value in each remote type's full domain.
 
+Decimal and numeric values are retrieved as text and are bounded by what the
+driver reports, not by the precision alone: a buffer is sized from
+`SQL_DESC_DISPLAY_SIZE` so a sign and a decimal point are budgeted for. If a
+driver reports a display size that turns out to be too small and then declines
+to finish delivering the value, the scan fails with the column and both lengths
+named. It does not return the shortened number, because `numeric(p,s)` would
+pad the missing digits back with zeros and the result would be indistinguishable
+from a correct amount.
+
 SQLite's dynamic type system and the SQLite ODBC bridge's metadata explain the
 different `NUMERIC` import result recorded above. Microsoft ODBC Driver 18
 reports SQL Server `TIME` metadata as the vendor-specific type `-154`; the
@@ -421,14 +430,34 @@ generated table definition. A hand-written foreign table may use PostgreSQL's
 input conversion for additional remote textual representations, but that
 behavior is driver-dependent and should be tested explicitly.
 
-ODBC drivers disagree on how national character types should be retrieved.
-The default `wide_char_mode 'char'` uses `SQL_C_CHAR` and preserves the
-extension's established behavior. Set `wide_char_mode 'wchar'` on a server—or
-on one foreign table as an override—when its driver requires `SQL_C_WCHAR`.
+ODBC drivers disagree on how national character types should be retrieved, and
+the disagreement cannot be resolved automatically. The default
+`wide_char_mode 'char'` uses `SQL_C_CHAR`. Set `wide_char_mode 'wchar'` on a
+server—or on one foreign table as an override—when a driver requires
+`SQL_C_WCHAR`; the Oracle, MySQL, and SQL Server suites here do exactly that.
 The wrapper accepts both 2-byte UTF-16 and 4-byte UTF-32 `SQLWCHAR`
-representations. This setting is explicit because a driver may return corrupted
-text instead of an error for the wrong target, so automatic fallback cannot be
-made reliable.
+representations, validates code points and surrogate pairs, and converts to the
+server encoding.
+
+The setting is explicit because the wrong target can produce **corrupted text
+rather than an error**, and that is measured rather than theoretical. Asked for
+a wide target, the SAP HANA client returns its UTF-8 bytes zero-extended into
+`SQLWCHAR` units instead of UTF-16, so every byte becomes a code point and the
+value arrives double encoded — `Grüße` as 11 bytes instead of 7, with no
+diagnostic. The same rows through `SQL_C_CHAR` are byte-exact. Because a driver
+returning plausible wrong text is indistinguishable from one returning the
+truth, neither probing nor automatic fallback can be made reliable, and the
+default is the one that changes nothing for an existing installation.
+
+Drivers that report no wide types at all, such as psqlODBC and SQLite ODBC in
+the suites here, are unaffected by either setting.
+
+Floating point columns (`SQL_REAL`, `SQL_FLOAT`, `SQL_DOUBLE`) are retrieved as
+binary values and rendered by PostgreSQL's own float output rather than by the
+driver. A driver's text rendering is not required to round-trip the value: one
+tested client renders `double` with 15 significant digits, which both loses the
+17th digit of a full-precision value and renders `DBL_MAX` as a number larger
+than `DBL_MAX`, which PostgreSQL then rejects as out of range.
 
 ## Security and operations
 

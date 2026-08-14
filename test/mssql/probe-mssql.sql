@@ -99,6 +99,11 @@ CREATE FOREIGN TABLE probe.wide_decimal_s0 (
     schema 'dbo', table 'ODBC_FDW_WIDE_DECIMAL_S0', id 'ID',
     d38_0 'D38_0', d32_0 'D32_0'
 );
+CREATE FOREIGN TABLE probe.scripts (id integer, script_name text, value text)
+SERVER mssql OPTIONS (
+    schema 'dbo', table 'ODBC_FDW_SCRIPTS', id 'ID',
+    script_name 'SCRIPT_NAME', value 'VALUE'
+);
 CREATE FOREIGN TABLE probe.large_values (id integer, text_value text, blob_value bytea)
 SERVER mssql OPTIONS (
     schema 'dbo', table 'ODBC_FDW_LARGE_VALUES', id 'ID',
@@ -233,6 +238,26 @@ SELECT 'wide_decimal_scale0=' || CASE WHEN
     (SELECT d38_0 FROM probe.wide_decimal_s0 WHERE id = 2) = -99999999999999999999999999999999999999 AND
     (SELECT d32_0 FROM probe.wide_decimal_s0 WHERE id = 2) = -99999999999999999999999999999999 AND
     (SELECT d38_0 FROM probe.wide_decimal_s0 WHERE id = 1) = 99999999999999999999999999999999999999
+    THEN 'ok' ELSE 'bad' END;
+-- Wide retrieval across the scripts this distribution carries, compared against
+-- the same code points assembled locally. chr() builds them from code point
+-- numbers so this file stays ASCII and cannot itself be re-encoded in transit.
+SELECT 'scripts=' || CASE WHEN
+    (SELECT value FROM probe.scripts WHERE id = 1) =
+        chr(1055)||chr(1088)||chr(1080)||chr(1074)||chr(1077)||chr(1090) AND
+    (SELECT value FROM probe.scripts WHERE id = 2) = chr(21271)||chr(20140) AND
+    (SELECT value FROM probe.scripts WHERE id = 3) =
+        chr(128512)||chr(119070) AND
+    (SELECT length(value) FROM probe.scripts WHERE id = 3) = 2 AND
+    (SELECT octet_length(value) FROM probe.scripts WHERE id = 3) = 8 AND
+    (SELECT value FROM probe.scripts WHERE id = 4) =
+        chr(4656)||chr(4619)||chr(4637) AND
+    (SELECT value FROM probe.scripts WHERE id = 5) =
+        chr(7864)||' k'||chr(225)||chr(224)||'b'||chr(7885)||chr(768) AND
+    (SELECT value FROM probe.scripts WHERE id = 6) =
+        chr(2002)||chr(2014)||chr(1999) AND
+    (SELECT value FROM probe.scripts WHERE id = 7) =
+        chr(11612)||chr(11568)||chr(11618)
     THEN 'ok' ELSE 'bad' END;
 SELECT 'large_value=' || CASE WHEN
     (SELECT length(text_value) FROM probe.large_values) = 6000 AND
