@@ -132,9 +132,47 @@ leak_session() {
 # Count real PDB sessions through V_$SESSION. This needs a direct grant to the
 # dedicated test account. The held cursor is the instrument control proving the
 # account can see another session before any zero-delta result is trusted.
+#
+# The foreign tables are created in their own backend, and the account's ability
+# to SEE V_$SESSION is established separately, because the two failures are not
+# the same thing. Without that split, an account lacking the grant fails the
+# whole suite with a message about reading four counts, which reads as a leak
+# regression and is not one -- it is a privilege the fixtures never had. The
+# readings below still share ONE backend with the scans they measure, which is
+# what the gate actually depends on.
+leak_setup_stderr="$(mktemp)"
+psql -X -q -t -A -h "${socket_dir}" -p "${port}" -U postgres postgres \
+    -f /workspace/test/oracle/oracle-leak-setup.sql >/dev/null 2>"${leak_setup_stderr}" \
+    || fail "the session-leak fixtures could not be created: $(awk '/^psql:.*ERROR:/ { sub(/^.*ERROR:  */, ""); print; exit }' "${leak_setup_stderr}")"
+rm -f "${leak_setup_stderr}"
+
+session_probe_stderr="$(mktemp)"
+session_probe="$(echo 'SELECT session_count FROM probe.oracle_sessions;' \
+    | leak_session 2>"${session_probe_stderr}")"
+# The WHOLE diagnostic, not its first line: odbc_fdw reports its own message
+# ("Executing ODBC query") and carries the driver's text on a continuation line,
+# so ORA-00942 never appears where an ERROR:/DETAIL: parse would find it.
+session_probe_err="$(cat "${session_probe_stderr}")"
+session_probe_reason="$(awk '/^ERROR:/ { sub(/^ERROR:  */, ""); print; exit }' "${session_probe_stderr}")"
+rm -f "${session_probe_stderr}"
+
+if [[ ! "${session_probe}" =~ ^[0-9]+$ ]]; then
+    # Only a visibility problem may skip. Anything else is a real failure and
+    # must stay one, or this becomes a gate that disables itself under load.
+    case "${session_probe_err}" in
+        *ORA-00942*|*ORA-01031*|*42S02*|*"table or view does not exist"*|*"insufficient privileges"*)
+            leak_summary=$'\n  session-leak gate SKIPPED: ORACLE_USER cannot read SYS.V_$SESSION.'
+            leak_summary+=' Run GRANT SELECT ON SYS.V_$SESSION TO <ORACLE_USER>; as a DBA to enable it.'
+            ;;
+        *)
+            fail "the session-leak gate could not read a session count: ${session_probe_reason:-no error reported}"
+            ;;
+    esac
+fi
+
+if [[ -z "${leak_summary:-}" ]]; then
 leak_stderr="$(mktemp)"
 leak_counts="$( {
-    cat /workspace/test/oracle/oracle-leak-setup.sql
     echo 'SELECT session_count FROM probe.oracle_sessions;'
     echo 'BEGIN;'
     echo 'DECLARE leak_held CURSOR FOR SELECT id FROM probe.leak_success;'
@@ -193,10 +231,16 @@ commit_delta=$(( $(tail -n 1 <<<"${commit_counts}") - $(head -n 1 <<<"${commit_c
 [[ "${commit_delta}" -eq 0 ]] \
     || fail "a committed subtransaction followed by an outer abort leaked ${commit_delta} Oracle sessions"
 checks=$(( checks + 1 ))
+fi
 
 if [[ -n "${ORACLE_BULK_ROWS:-}" ]]; then
     [[ "${ORACLE_BULK_ROWS}" =~ ^[1-9][0-9]*$ ]] \
         || fail 'ORACLE_BULK_ROWS must be a positive integer'
+    # This gate asserts that two bulk transfers leak no sessions, so it cannot
+    # run without the same grant. Refused rather than skipped: the operator
+    # asked for it explicitly.
+    [[ -z "${leak_summary:-}" ]] \
+        || fail 'ORACLE_BULK_ROWS needs the session-leak grant: GRANT SELECT ON SYS.V_$SESSION TO <ORACLE_USER>;'
     bulk_checksum=$(( ORACLE_BULK_ROWS * (ORACLE_BULK_ROWS + 1) / 2 ))
     bulk_rss="SELECT (string_to_array(pg_read_file('/proc/self/statm', 0, 128), ' '))[2]::bigint * 4096"
     bulk_scan="SELECT count(*) || '/' || sum(id)::bigint FROM probe.bulk"
@@ -234,4 +278,4 @@ else
     bulk_summary=' (bulk transfer SKIPPED; set ORACLE_BULK_ROWS in .env to run it)'
 fi
 
-echo "Oracle 19c integration suite through Instant Client 21: passed (${checks} assertions)${bulk_summary}"
+echo "Oracle 19c integration suite through Instant Client 21: passed (${checks} assertions)${bulk_summary}${leak_summary:-}"
