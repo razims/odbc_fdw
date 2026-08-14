@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
-# Pin the PostgreSQL base and the HANA client as build inputs. The HANA values
-# are copied from dwh's measured PostgreSQL 18 image: change each version and
-# its architecture-specific digests together, never through .env.
+# Pin the PostgreSQL base and both proprietary ODBC clients as build inputs.
+# Change a client version and all of its architecture-specific digests in the
+# same commit; credentials and database coordinates belong in .env, versions
+# never do.
 ARG PG_IMAGE=postgres:18-trixie@sha256:d129b9577d274bb96cbd44d902bdeb1b935c89247d161241e9154cba64e13df4
 ARG HANA_CLIENT_VERSION=2.29.25
 ARG HANA_CLIENT_SHA256_AMD64=3836373eaa62c9461f6803f2102c9fd899439bad6329e10f71f32ec673c006b7
@@ -11,6 +12,11 @@ ARG HANA_DRIVER_SHA256_AMD64=a1bab067dfcc771ab87f4f0c6f8af5400de22f2959850f613f1
 ARG HANA_DRIVER_SHA256_ARM64=db4b4cb73c74319aa4cd4c3edf735471d999e615a2317a172af64d81a6805547
 ARG HANA_SQLDBC_SHA256_AMD64=d0be5b01571456e4389b3d54941043cadab211aa8a497d6179ebdce4ccd4b29b
 ARG HANA_SQLDBC_SHA256_ARM64=e7439a37a00a52ee772877470783373ce32a5ed281d1ff110739892837f99771
+ARG ORACLE_CLIENT_VERSION=21.23.0.0.0dbru
+ARG ORACLE_CLIENT_DOWNLOAD_DIR=2123000
+ARG ORACLE_CLIENT_INSTALL_DIR=instantclient_21_23
+ARG ORACLE_BASIC_SHA256_AMD64=68a6ccd7ca6fbfb4d2914bd6531a8599fdb75841b8d47df5256bfef40d020820
+ARG ORACLE_ODBC_SHA256_AMD64=aec81a0e2660c1154690d7b1334255973072cc1a38b23134301a94091038a365
 
 FROM ${PG_IMAGE} AS dev
 
@@ -93,7 +99,69 @@ COPY src/ /workspace/src/
 COPY odbc_fdw--*.sql /workspace/
 COPY docker/ /workspace/docker/
 COPY test/hana/ /workspace/test/hana/
+COPY test/oracle/ /workspace/test/oracle/
 RUN cc -std=c11 -Wall -Wextra -Werror -O2 /workspace/test/hana/hana-exec.c \
         -lodbc -o /usr/local/bin/hana-exec \
+    && cc -std=c11 -Wall -Wextra -Werror -O2 /workspace/test/oracle/oracle-exec.c \
+        -lodbc -o /usr/local/bin/oracle-exec \
     && chmod 0555 /usr/local/bin/hana-exec \
-    && chmod +x /workspace/docker/*.sh /workspace/test/hana/*.sh
+    && chmod 0555 /usr/local/bin/oracle-exec \
+    && chmod +x /workspace/docker/*.sh /workspace/test/hana/*.sh /workspace/test/oracle/*.sh
+
+# Oracle does not publish Instant Client 21 for Linux ARM64. Keep the ordinary
+# and HANA test runners multi-architecture, and isolate Oracle in an amd64-only
+# stage that Docker can emulate on ARM hosts. The ODBC package is an add-on to
+# Basic, so both official, SHA-pinned archives are extracted together. No DSN,
+# tnsnames.ora, database coordinate, or credential is baked into the image.
+FROM test-runner AS oracle-test-runner
+
+USER root
+
+# Instant Client 21 requests the pre-time64 SONAME. libaio's public ABI did not
+# change, but Debian 13 ships only libaio.so.1t64; expose the SONAME the
+# proprietary binary was linked against inside this amd64-only stage.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libaio1t64 \
+        libnsl2 \
+        unzip \
+    && ln -s libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+ARG ORACLE_CLIENT_VERSION
+ARG ORACLE_CLIENT_DOWNLOAD_DIR
+ARG ORACLE_CLIENT_INSTALL_DIR
+ARG ORACLE_BASIC_SHA256_AMD64
+ARG ORACLE_ODBC_SHA256_AMD64
+RUN test "${TARGETARCH}" = amd64 \
+    || { echo "Oracle Instant Client 21 is not published for Linux TARGETARCH='${TARGETARCH}'; build oracle-test-runner as linux/amd64." >&2; exit 1; } \
+    && curl --fail --silent --show-error --location \
+        --proto '=https' --proto-redir '=https' \
+        --output /tmp/oracle-basic.zip \
+        "https://download.oracle.com/otn_software/linux/instantclient/${ORACLE_CLIENT_DOWNLOAD_DIR}/instantclient-basic-linux.x64-${ORACLE_CLIENT_VERSION}.zip" \
+    && curl --fail --silent --show-error --location \
+        --proto '=https' --proto-redir '=https' \
+        --output /tmp/oracle-odbc.zip \
+        "https://download.oracle.com/otn_software/linux/instantclient/${ORACLE_CLIENT_DOWNLOAD_DIR}/instantclient-odbc-linux.x64-${ORACLE_CLIENT_VERSION}.zip" \
+    && echo "${ORACLE_BASIC_SHA256_AMD64}  /tmp/oracle-basic.zip" | sha256sum --check --strict - \
+    && echo "${ORACLE_ODBC_SHA256_AMD64}  /tmp/oracle-odbc.zip" | sha256sum --check --strict - \
+    && install -d -m 0755 /opt/oracle \
+    && unzip -oq /tmp/oracle-basic.zip -d /opt/oracle \
+    && unzip -oq /tmp/oracle-odbc.zip -d /opt/oracle \
+    && test -f "/opt/oracle/${ORACLE_CLIENT_INSTALL_DIR}/libsqora.so.21.1" \
+    && chown -R root:root "/opt/oracle/${ORACLE_CLIENT_INSTALL_DIR}" \
+    && printf '%s\n' "/opt/oracle/${ORACLE_CLIENT_INSTALL_DIR}" \
+        > /etc/ld.so.conf.d/oracle-instantclient.conf \
+    && ldconfig \
+    && test "$(ldd "/opt/oracle/${ORACLE_CLIENT_INSTALL_DIR}/libsqora.so.21.1" | grep -c 'not found')" -eq 0 \
+    && printf '%s\n' \
+        '[Oracle 21 ODBC driver]' \
+        'Description = Oracle Instant Client 21 ODBC driver baked into this test image' \
+        "Driver = /opt/oracle/${ORACLE_CLIENT_INSTALL_DIR}/libsqora.so.21.1" \
+        >> /etc/odbcinst.ini \
+    && odbcinst -q -d | grep -Fx '[Oracle 21 ODBC driver]' \
+    && rm -f /tmp/oracle-basic.zip /tmp/oracle-odbc.zip
+
+ENV NLS_LANG=.AL32UTF8
+ENV TNS_ADMIN=/opt/oracle/instantclient_21_23/network/admin

@@ -62,10 +62,6 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 
-#if defined(_WIN32)
-#define strcasecmp _stricmp
-#endif
-
 /* TupleDescAttr was backported into 9.5.9 and 9.6.5 but we support any 9.5.X. */
 #if PG_VERSION_NUM < 90605
 #ifndef TupleDescAttr
@@ -102,7 +98,12 @@
 #define ODBC_SQLSTATE_LENGTH 5
 
 typedef enum { NO_TRUNCATION, FRACTIONAL_TRUNCATION, STRING_TRUNCATION } GetDataTruncation;
-typedef enum { TEXT_CONVERSION, BIN_CONVERSION, BOOL_CONVERSION } ColumnConversion;
+typedef enum {
+	TEXT_CONVERSION,
+	WIDE_TEXT_CONVERSION,
+	BIN_CONVERSION,
+	BOOL_CONVERSION
+} ColumnConversion;
 
 typedef struct odbcFdwOptions
 {
@@ -112,6 +113,8 @@ typedef struct odbcFdwOptions
 	char  *sql_query;
 	char  *sql_count;
 	char  *encoding;
+	bool  use_wide_char;
+	bool  wide_char_mode_set;
 	int64 max_field_size;
 	int64 max_row_count;
 	int64 max_result_size;
@@ -153,6 +156,15 @@ static inline bool
 is_blank_string(const char *s)
 {
 	return s == NULL || s[0] == '\0';
+}
+
+/* ISO C replacement for POSIX strnlen, also available to Windows builds. */
+static inline size_t
+odbc_bounded_strlen(const char *s, size_t maxlen)
+{
+	const char *end = (const char *) memchr(s, '\0', maxlen);
+
+	return end == NULL ? maxlen : (size_t) (end - s);
 }
 
 /* FDW callbacks registered by odbc_fdw_handler. */

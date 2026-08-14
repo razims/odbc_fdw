@@ -467,7 +467,7 @@ check_return(SQLRETURN ret, const char *msg, SQLHANDLE handle, SQLSMALLINT type)
 				appendStringInfoChar(&error_msg, '\n');
 				if (remaining > 1)
 					appendBinaryStringInfo(&error_msg, (char *) text,
-					                       Min((int) strnlen((char *) text,
+					                       Min((int) odbc_bounded_strlen((char *) text,
 					                                         sizeof(text) - 1),
 					                           remaining - 1));
 			}
@@ -482,52 +482,17 @@ check_return(SQLRETURN ret, const char *msg, SQLHANDLE handle, SQLSMALLINT type)
 void
 getNameQualifierChar(SQLHDBC dbc, StringInfoData *nq_char)
 {
-	/*
-	 * Zero-initialised: SQLGetInfo leaves this untouched if it fails, and the
-	 * blank test below has to be a test of what the driver said rather than of
-	 * whatever was on the stack.
-	 */
-	SQLCHAR name_qualifier_char[2] = {0, 0};
-	SQLSMALLINT info_len = 0;
-	SQLRETURN ret;
-
 	elog_debug("%s", __func__);
-
-	ret = SQLGetInfo(dbc,
-	                 SQL_CATALOG_NAME_SEPARATOR,
-	                 (SQLPOINTER)&name_qualifier_char,
-	                 sizeof(name_qualifier_char),
-	                 &info_len);
-	check_return(ret, "Reading ODBC catalog separator", dbc, SQL_HANDLE_DBC);
-	if (info_len > 1)
-		ereport(ERROR,
-		        (errcode(ERRCODE_FDW_ERROR),
-		         errmsg("ODBC driver returned a multi-byte catalog separator")));
-	name_qualifier_char[1] = 0; // some drivers fail to copy the trailing zero
-
+	(void) dbc;
 	initStringInfo(nq_char);
 	/*
-	 * Default a blank separator to ".".
-	 *
-	 * SQL_CATALOG_NAME_SEPARATOR describes how a CATALOG is joined to the name
-	 * that follows it, so a driver for a database with no catalogs may quite
-	 * correctly report it as empty -- SAP HANA's namespace is schema-based and
-	 * libodbcHDB does exactly that. Every caller here, however, uses this
-	 * string to join a SCHEMA to a table. Empty therefore emitted
-	 * "SYS""DUMMY", which is ONE identifier containing a doubled (escaped)
-	 * quote, resolved against the connecting user's default schema:
-	 *   Base table or view not found;259 invalid table name:
-	 *   Could not find table/view SYS"DUMMY in schema <CONNECTING USER'S SCHEMA>
-	 * Fixing it here rather than at a call site covers both places that build
-	 * a qualified name -- odbcGetTableSize and odbcBeginForeignScan -- so the
-	 * failure cannot simply move one step later. "." is the only separator SQL
-	 * defines between a schema and a table, and a driver that does report one
-	 * still gets its own.
+	 * Every caller joins a SCHEMA to a table, for which SQL defines ".".  The
+	 * previous SQL_CATALOG_NAME_SEPARATOR lookup asked a different question and
+	 * can legitimately return an empty string or a catalog-specific separator.
+	 * Using that answer for schema qualification produces malformed SQL. Keep
+	 * this helper centralized so scans and row-count queries cannot disagree.
 	 */
-	if (name_qualifier_char[0] == 0)
-		appendStringInfoString(nq_char, ".");
-	else
-		appendStringInfo(nq_char, "%s", (char *) name_qualifier_char);
+	appendStringInfoString(nq_char, ".");
 }
 
 /*
@@ -601,7 +566,7 @@ is_sensitive_connection_attribute(const char *attr_name)
 
 	for (i = 0; sensitive_names[i]; i++)
 	{
-		if (strcasecmp(attr_name, sensitive_names[i]) == 0)
+		if (pg_strcasecmp(attr_name, sensitive_names[i]) == 0)
 			return true;
 	}
 	return false;
@@ -700,7 +665,7 @@ odbcGetTableSize(odbcFdwOptions* options, SQLUBIGINT *size)
 			if (query_len > 0 && query[query_len - 1] == ';')
 				query[query_len - 1] = '\0';
 			appendStringInfo(&sql_str,
-			                 "SELECT COUNT(*) FROM (%s) AS _odbc_fwd_count_wrapped",
+			                 "SELECT COUNT(*) FROM (%s) _odbc_fdw_count_wrapped",
 			                 query);
 		}
 	}
@@ -753,7 +718,13 @@ oid_from_server_name(const char *serverName)
 	                                       ACL_USAGE);
 #endif
 	if (aclresult != ACLCHECK_OK)
+	{
+#if PG_VERSION_NUM >= 110000
 		aclcheck_error(aclresult, OBJECT_FOREIGN_SERVER, serverName);
+#else
+		aclcheck_error(aclresult, ACL_KIND_FOREIGN_SERVER, serverName);
+#endif
+	}
 
 	return server->serverid;
 }

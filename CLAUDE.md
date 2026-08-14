@@ -1,379 +1,293 @@
 # CLAUDE.md
 
-Instructions for working in this repository.
+Instructions for changing this repository.
 
-## What this is
+## Project scope
 
-Softinent's vendored **ODBC foreign-data wrapper for PostgreSQL**, derived from
-`devrimgunduz/odbc_fdw` at commit `ee741f5` (its tag `0.6.1`), itself derived
-from CartoDB's `odbc_fdw`. The implementation is organised below `src/`: FDW
-registration, options, ODBC connections/catalog helpers, scan execution, and
-schema import each have a focused compilation unit, with `odbc_fdw.h` defining
-their private contract. There is no application here: it is a shared library
-loaded into a PostgreSQL backend, so almost every mistake is a memory-safety
-mistake.
+This is Softinent's maintained distribution of `odbc_fdw`, derived from
+`devrimgunduz/odbc_fdw` at commit `ee741f5` (tag `0.6.1`). It is a generic,
+read-only PostgreSQL foreign data wrapper that connects through unixODBC.
 
-**Target: PostgreSQL 18.** That is the only major version this release has been
-compiled and exercised against, and the only one the README claims. It is
-consumed by Softinent's `dwh` warehouse, whose image clones this repository **by
-tag** and asserts the commit — so a moved tag breaks that build, by design.
+The implementation is a native shared library loaded into PostgreSQL backend
+processes. Treat memory safety, driver input, handle lifetime, and error
+unwinding as database-instance concerns rather than ordinary application bugs.
 
-Read `README.md` first. It is the published documentation and the single
-authority on behaviour; this file is for whoever is *changing* the code.
+The source carries PostgreSQL compatibility branches from 9.5 through 18.
+PostgreSQL 18 is the current maintained build and test target; the predecessor
+project historically tested 9.5 through 12. Do not remove an older-version
+branch merely because the current Docker suite does not exercise it. Read
+`README.md` first; it is the public contract. This file records maintenance
+invariants that are easy to break while refactoring.
 
-## Keep the documentation current
+## Keep documentation synchronized
 
-`README.md`, `NEWS.md` and this file are living documents. Docker is the only
-supported development environment (see Testing), so the build and test commands
-are a real safety boundary rather than examples to translate for each host.
+`README.md`, `CHANGELOG.md`, and this file are living documents.
 
-| Changed | Also update |
+| Change | Also update |
 | --- | --- |
-| an option added, renamed or removed | `valid_options[]`, `extract_odbcFdwOptions`, the validator, README's option table, this file |
-| `default_version` | the SQL script's filename, `Makefile`'s `DATA`, a new `odbc_fdw--<prev>--<new>.sql`, `NEWS.md`, README's Versioning section, and the annotated tag |
-| a defect fixed | README "What this release fixes", and remove it from "Known defects" if it was listed there |
-| a defect found and not fixed | README "Known defects, not fixed here" — writing it down is the deliverable |
-| a type mapping in `sql_data_type` | README's supported-types list |
+| option added, renamed, or removed | option validation, extraction, README option table, and tests |
+| type mapping changed | README type table and import tests |
+| extension version changed | control file, base SQL file, Makefile `DATA`, upgrade SQL, changelog, README, and annotated tag |
+| behavior fixed | changelog and a regression test |
+| compatibility evidence changed | README compatibility table |
 
-## Invariants — do not "simplify" these
+Public documentation describes a generic ODBC extension. Product-specific
+connection instructions belong in executable integration-test infrastructure,
+not in the README or contributor narrative. Database product names may appear
+in the README compatibility table as test evidence.
 
-Each of these was a real defect, or the direct cause of one. They look like
-oversights. They are not.
+## Option invariants
 
-**An option name prefixed `odbc_` is passed STRAIGHT INTO the ODBC connection
-string.** `is_odbc_attribute` recognises it and this extension never interprets
-it. Consequences, all measured:
+### `odbc_` means pass-through
 
-- The prefix is compared with `strncmp`, so it is **case-sensitive**. A name
-  whose prefix carries capitals is not recognised as a connection attribute.
-- What happens then depends entirely on context, and one arm is silent. On a
-  **server**: `ERROR: invalid option "ODBC_SERVERNODE"`. On a **user mapping**:
-  `ERROR: invalid option "ODBC_UID"`, hint `Valid options in this context are:
-  <none>`. On a **foreign table**: **accepted silently**, because a table's
-  options double as column-name mappings, so the name becomes one and does
-  nothing.
-- PostgreSQL folds an **unquoted** option name to lower case before the
-  validator sees it, so `odbc_DRIVER` and `odbc_driver` are one option. The
-  case-sensitivity above therefore only bites on a **double-quoted** name.
-  Verified: `"ODBC_SERVERNODE"` is refused, `odbc_SERVERNODE` is accepted and
-  stored as `odbc_servernode`; `"odbc_ServerName"` is accepted with its case
-  preserved.
+An option prefixed with `odbc_` is converted to an ODBC connection-string
+attribute. The FDW does not interpret it.
 
-So: **never give one of our own options an `odbc_` prefix**, and never add a
-generic `option key=value` pass-through. ODBC accepts `UID` and `PWD` in a
-connection string, which means such an option can legally *be* a password — and
-`pg_foreign_server.srvoptions` is readable by every role and travels in every
-`pg_dump`, unlike a user mapping's options, which `pg_user_mappings` blanks for
-anyone but the server's owner. Confirmed from the other side while building the
-ceilings: `odbc_MAX_ROW_COUNT` on a server reached the driver, which ignored it,
-and bounded nothing.
+- The prefix comparison is case-sensitive. PostgreSQL folds unquoted option
+  names to lower case, but a quoted upper-case prefix is not recognised.
+- `DRIVER`, `DSN`, `UID`, and `PWD` are normalised to upper case. Other
+  attribute names preserve their stored spelling.
+- An unrecognised server or user-mapping option is rejected. An unrecognised
+  foreign-table option becomes a remote column mapping, so a misspelled option
+  can be accepted silently and change the generated query.
+- Never give an FDW-owned option an `odbc_` prefix.
+- Never add a generic key/value pass-through that bypasses the existing
+  validation and privilege rules.
 
-**Our option names must be claimed in `extract_odbcFdwOptions` BEFORE the
-column-mapping fallthrough.** An unrecognised foreign-table option there is
-taken for the name of a remote column. A new option that is registered in
-`valid_options[]` but not claimed in extraction is therefore not
-"silently ignored" — it becomes a column mapping and changes the query.
+Driver and DSN selection is superuser-only in every object context. The driver
+manager loads the selected native library into the backend, so this restriction
+applies equally to `driver`, `dsn`, `odbc_driver`, and `odbc_dsn`.
 
-**Ceilings fold TIGHTEST WINS, never last-wins.** `odbcGetOptions` concatenates
-table options, then server options, then user-mapping options, and extraction
-assigns as it goes — so a plain assignment makes the **server's** value win by
-position, and any reordering of those lists would let a **table raise** a
-ceiling an operator set on the server. A ceiling that can be raised from the
-object it constrains is not a ceiling. `apply_limit_option` folds to the
-minimum, which also makes the outcome independent of that order, so it cannot
-change if upstream reorders the concatenation. `0` means unlimited and therefore
-**loses** to any positive value; it can never loosen a ceiling already in force.
-Measured in all three directions: server 50 with a table asking 1000000 is
-refused at 50, a table asking 10 is refused at 10, and a table asking 0 is still
-refused at 50.
+Credentials belong in user mappings. Server options are visible through
+catalogs and included in dumps; user-mapping options are hidden from roles that
+do not own the server.
 
-**Ceiling values are validated in the VALIDATOR, at DDL time.** They were not
-at first, and it was measured: `max_row_count 'lots'`, `max_field_size '-1'` and
-`max_field_size '100MB'` were all accepted by `CREATE SERVER` and
-`CREATE FOREIGN TABLE`, with the complaint deferred to the first query — so the
-DDL containing the mistake reported success and something unrelated failed
-later. A ceiling nobody can tell they set wrongly is worse than no ceiling. The
-validator's sink is per-option and discarded: only the parse and the range
-matter there, not the folding.
+### Claim FDW options before column mappings
 
-**`max_field_size` is enforced in TWO places and both are required.** The check
-inside the chunk loop bounds *memory* while the value is still being assembled,
-so a runaway field is refused at ceiling-plus-one-chunk rather than after the
-whole thing exists — but it runs *before* each chunk, so a value arriving in a
-single chunk never reaches it. The check after the loop is the exact one, on the
-value's real length. Measured both arms: a 12000-byte value against a ceiling of
-5000 is caught mid-assembly (the message carries no length), a 100-byte value
-against a ceiling of 10 is caught by the exact test (the message carries `100
-bytes`). `max_result_size` is enforced from the same two places, for the same
-reason, through one function so the predicate exists once.
+`extract_odbcFdwOptions` must handle every FDW-owned foreign-table option before
+the mapping fallthrough. Registering an option in `valid_options[]` without
+extracting it turns the option into a remote column name.
 
-**`check_result_size` compares by SUBTRACTION, and that is not a style
-choice.** `max_result_size` is any non-negative `int64` an operator cares to
-type, so `done_bytes + field_bytes > max` is the side of the inequality that can
-overflow. The function maintains `done_bytes <= max_result_size` — the check runs
-*before* the running total is charged — which makes `max - done` non-negative and
-the comparison total. Charge after checking, never before.
+### Resource ceilings use the tightest value
 
-**A ceiling is per SCAN, and `ReScanForeignScan` restarts its counters.** Not per
-query, session or transaction. A rescan is the planner's choice, not the
-operator's, so counting cumulatively across rescans would make whether a query
-succeeds depend on whether a `Memoize` node was costed in. Measured: a ceiling of
-exactly 2000 rows against a 2000-row remote succeeds on all three rescans of a
-correlated subquery, and 1999 raises on each.
+`max_field_size`, `max_row_count`, and `max_result_size` are valid on servers
+and foreign tables. They fold to the smallest positive value regardless of the
+order in which option lists are combined. Zero means unlimited and cannot
+loosen a positive limit already in force.
 
-**There is deliberately NO `CHECK_FOR_INTERRUPTS()` at the row boundary in
-`odbcIterateForeignScan`, and a comment in the source says so.** This is a
-measured negative result, not an omission: `ExecScan` already checks interrupts
-once per tuple a scan node returns, and this FDW is only ever driven from there
-(`odbcAnalyzeForeignTable` returns false, so `ANALYZE` does not sample, and
-`IterateForeignScan` has no other caller). Measured against a live tenant with
-`statement_timeout = 5s` on a 3,000,000-row scan and **no** check anywhere in
-the extension, using three shapes that put the per-tuple loop in three different
-places — `COPY` of every row, `count(*)`, and a non-pushed-down qual matching
-nothing. All three were cancelled at 5s. Adding one there would be redundant. The
-check that *is* needed is one level down, inside the chunked read, which is the
-only part of a scan PostgreSQL cannot reach.
+Validate ceiling syntax and range in the validator so invalid DDL fails when it
+is executed, not during a later scan.
 
-**Bad lengths are REFUSED, never clamped.** Every guard in the retrieval path
-raises rather than reading a different amount than the driver was asked for. A
-length that has already gone wrong means the arithmetic is wrong, and quietly
-reading around it converts a detectable fault into a wrong answer — which is the
-failure mode this repository exists to eliminate, not one to add.
+`max_field_size` and `max_result_size` each require two checks:
 
-**A ceiling is not isolation, and the README must never imply it is.** The ODBC
-driver runs **inside the backend**. A fault in the driver is a `SIGSEGV`, and
-PostgreSQL's `HandleChildCrash` SIGQUITs every other backend and replays WAL —
-crash recovery for every session in every database on the instance. Only a
-process boundary would change that. The ceilings bound what a runaway *remote*
-can make *this extension* allocate, and nothing more. Say exactly that.
+- an in-loop check bounds memory while a chunked value is assembled;
+- an exact post-loop check catches a value delivered in one chunk.
 
-**`palloc` does not zero; `palloc0` does.** The single worst defect in this
-lineage was one `palloc` whose slots were then read as C strings. Any array
-handed to `BuildTupleFromCStrings` is sized by `natts` — the FOREIGN TABLE's
-column count — and zeroed, because a result column that matches no table column
-is skipped and its slot must be a SQL NULL rather than whatever was on the heap.
+`check_result_size` compares by subtraction. `done + field` may overflow for
+an arbitrary non-negative `int64` ceiling; `field > max - done` does not while
+the maintained invariant `done <= max` holds.
 
-**Identifier comparison uses `pg_strcasecmp`, not `strcmp` and not
-`strcasecmp`.** PostgreSQL folds unquoted identifiers **down**; SAP HANA, Oracle
-and DB2 fold **up**. `strcmp` therefore never matched and dropped the column
-silently. `strcasecmp` is locale-dependent and is the wrong tool for an
-identifier; `pg_strcasecmp` is PostgreSQL's own locale-independent ASCII
-compare, used throughout the backend for exactly this.
+Ceilings are per scan. `ReScanForeignScan` re-executes the statement and resets
+row and byte counters. Whether a query succeeds must not depend on the planner
+choosing a rescan, materialization, or memoization shape.
 
-**`SQL_CATALOG_NAME_SEPARATOR` describes a CATALOG separator, and this code uses
-it to join a SCHEMA to a table.** They are not the same thing, so a driver for a
-database with no catalogs may correctly report it empty. Defaulted to `.` in
-`getNameQualifierChar` rather than at a call site, so both places that build a
-qualified name are covered — patching only one moves the failure one step later.
+The limits count bytes retrieved by the FDW. They do not represent the
+backend's full memory high-water mark and are not a process-isolation boundary.
 
-**`result_size` from `SQLGetData` is an INDICATOR, not always a length.**
-`SQL_NULL_DATA` is −1 and `SQL_NO_TOTAL` is −4. Adding it to a running total
-unchecked drove the total negative and ran `strnlen(buffer, (size_t) -1)`. Any
-new arithmetic on a driver-reported length gets the same treatment: check the
-sign, check the range, refuse.
+## Scan and conversion invariants
 
-**`ldd` proves that LINKED dependencies resolve, and nothing else.**
-`odbc_fdw.so` links only the unixODBC **driver manager**; the actual driver is
-`dlopen`ed by the driver manager at *connect* time. So a build can be clean, the
-`.so` can load, `CREATE EXTENSION` can succeed, a server can be created — and
-the first foreign scan still fails with `[unixODBC][Driver Manager] Can't open
-lib`. `odbcinst -q -d` is the only check that reads `/etc/odbcinst.ini` the way
-a connection will.
+### Tuple arrays are sized by the foreign table
 
-**Never assert an installed file with a glob.** `odbc_fdw--*.sql` matched the six
-historical upgrade scripts whether or not the file `CREATE EXTENSION` needs was
-built, so it was an assertion that could not fail for the reason it claimed.
-Those scripts are gone, and any future check names the file it means.
+Arrays passed to `BuildTupleFromCStrings` are sized by `natts`, not by the
+number of result columns, and allocated with `palloc0`. A result column may not
+map to a local attribute; the untouched local slot must be SQL NULL rather than
+uninitialised memory.
 
-## Licence and attribution — a condition, not a courtesy
+### Column matching is exact before case-insensitive
 
-The licence is an MIT-style grant permitting exactly what we are doing, on one
-condition: the notice travels with the software. Meet it precisely.
+Prefer an exact result-column match. Permit a case-insensitive fallback only
+when it is unique. Use PostgreSQL's `pg_strcasecmp`, not `strcmp` or the
+locale-dependent system `strcasecmp`.
 
-- **`LICENSE`'s grant text stays byte-identical.** Do not reword, relicense or
-  move it — including the sentence upstream truncated mid-clause at
-  `OUT OF OR IN CONNECTION WITH THE`, which is theirs and is left as found. The
-  only permitted changes are above the grant: the copyright block, where
-  `Copyright (c) 2026, Softinent` sits below Devrim Gündüz's line, and the
-  sentence beneath it recording that our notice covers our modifications only.
-  Adding our own notice is not relicensing; it claims nothing over anyone else's
-  work and changes no term, and the sentence says so where a reader will see it
-  rather than leaving it to be inferred.
-- **Every existing copyright notice stays**, wherever it is: PostgreSQL Global
-  Development Group 2011, CARTO (2016 in the Makefile, 2016–2018 in the control
-  file, 2016–2020 in the SQL script), Zheng Yang and Gunnar "Nick" Bluth as
-  authors in `src/odbc_fdw.c`, Devrim Gündüz in `LICENSE`.
-- The files do **not** carry the same set of notices and must not be made
-  uniform. `src/odbc_fdw.c` has no CARTO line; adding one would be inventing a
-  notice on somebody else's behalf.
-- **`Copyright (c) 2026, Softinent` goes BELOW** the existing lines, in files we
-  substantially modify. Keep the year current for new work.
-- The README states provenance in its own right. A cleanup pass that turns it
-  into a footnote is a regression.
+This preserves remotes with a different identifier-folding convention while
+keeping case-distinct remote columns unambiguous.
 
-## Versioning
+### Schema qualification uses a period
 
-**One string, in both namespaces.** The annotated git tag and `default_version`
-in `odbc_fdw.control` are the same characters. This release is `1.0.1`, with no
-`v` prefix, because the tag has to be a string PostgreSQL will accept as an
-extension version.
+`SQL_CATALOG_NAME_SEPARATOR` answers how a catalog is joined to the following
+name. It does not define the separator between a schema and a table. Every
+generated schema-qualified table name uses SQL's period, through the shared
+qualification helper, so scans and metadata queries cannot disagree.
 
-Upstream let the two drift — tag `0.6.1`, `default_version` `0.5.2` — and the
-cost lands on the consumer twice: it must assert both literals by hand, because
-`<ext>--<tag>.sql` would look for a file that does not exist; and nothing
-readable from SQL can identify the build, because `pg_available_extensions`
-cannot see a git tag. Do not reintroduce that gap.
+### Driver lengths are indicators
 
-Ordinary semver, and **every release bumps it**: patch for a C-only fix, minor
-for a new option, major for a change to existing behaviour. Each bump renames
-the SQL script and adds `odbc_fdw--<prev>--<new>.sql` — **empty** if nothing in
-SQL changed, which is the honest artefact, because the alternative is telling an
-operator to `DROP EXTENSION`, and that `CASCADE`s away their foreign tables and
-every view built over them.
+An `SQLGetData` result length may instead be `SQL_NULL_DATA` or `SQL_NO_TOTAL`.
+Check sign and range before arithmetic. A failed `SQLFetch` is an error; only
+`SQL_NO_DATA` is the end of a result set.
 
-**`0.5.2` is forbidden as a version string, permanently, and the reason comes
-from outside this repository.** `dwh` refuses to create a HANA source unless
-`default_version` appears in an allowlist of builds whose data path has been
-**measured** correct (`ODBC_FDW_DATA_OK` in `dwhlib/const.py`). Stock upstream
-reports exactly `0.5.2` — tag 0.6.1, control file 0.5.2 — so allowlisting that
-string would admit the build that returns wrong values alongside the build that
-returns right ones, and a host on an older or rolled-back image would pass the
-gate silently. `dwh`'s test suite forbids `"0.5.2"` from that allowlist
-permanently. Any string we choose must not collide with it.
+Refuse impossible driver lengths and buffer geometry. Do not clamp them and
+continue with a different read: once length arithmetic is invalid, continuing
+risks either memory corruption or a silently wrong value.
 
-**Never rename the extension, the shared object, or the C entry points.**
-`odbc_fdw`, `odbc_fdw.so`, `odbc_fdw_handler` and `odbc_fdw_validator` are an
-interface: `dwh`'s image assertions, its `WRAPPERS` table and its `verify` checks
-all key on those four names.
+Chunked buffer growth is geometric. Reintroducing exact-size growth makes
+large-value assembly quadratic.
 
-## Building
+### Wide text is driver-sensitive
+
+Some ODBC drivers require national character types to be retrieved through
+`SQL_C_WCHAR`; others already transcode those types correctly through
+`SQL_C_CHAR` and return incorrect data through the wide target without an
+error. Keep this product-neutral: `wide_char_mode` selects the behavior on the
+foreign server or table, defaults to `char`, and must never be inferred from a
+database or driver product name. A table value wins over its server value.
+
+The wide path accepts aligned 2-byte UTF-16 or 4-byte UTF-32 `SQLWCHAR` units,
+validates code points and surrogate pairs, converts them to UTF-8, and then
+converts from UTF-8 to the PostgreSQL server encoding. PostgreSQL text cannot
+contain a zero code point.
+
+### Interrupt placement is deliberate
+
+There is no explicit interrupt check at the row boundary in
+`odbcIterateForeignScan`; PostgreSQL's executor already checks once per tuple.
+The explicit check belongs inside the chunked field-read loop, which is the
+part PostgreSQL cannot reach while one tuple is being assembled.
+
+This makes a long chunk loop cancellable. It cannot interrupt a driver call
+that is blocked inside the driver.
+
+## ODBC handle lifetime
+
+The executor does not guarantee that `odbcEndForeignScan` runs after every
+error. Environment, connection, and statement handles are therefore registered
+with transaction and subtransaction cleanup callbacks.
+
+- Release handles on successful completion, error, cancellation, and abort.
+- Adopt handles opened in a committed subtransaction into the parent.
+- Cleanup callbacks must not raise errors while PostgreSQL is already aborting.
+- Free the environment even when no connection handle was created.
+- Do not count a tidy backend exit as proof that an in-session error path is
+  leak-free; tests must observe the remote sessions while the backend remains
+  alive.
+
+## Metadata invariants
+
+Check every ODBC metadata call and validate NULL indicators, truncation, and
+integer widths before using returned values.
+
+`IMPORT FOREIGN SCHEMA` must refuse a zero-column result. PostgreSQL accepts an
+empty foreign-table declaration, but reporting a successful import for a
+missing table or entirely unsupported schema is misleading.
+
+Reuse metadata buffers within a statement. Per-table and per-column allocations
+that survive until statement end turn a large import into memory growth
+proportional to the remote catalog.
+
+Generated local SQL uses PostgreSQL's identifier and literal quoting helpers.
+Generated remote SQL quotes identifier parts using the quote character reported
+by the driver and doubles embedded quote characters.
+
+## Planner and helper invariants
+
+Plain `EXPLAIN` performs no remote connection or query. Use local estimates at
+planning time. Only execution, including `EXPLAIN ANALYZE`, may contact the
+remote.
+
+`ODBCTablesList`, `ODBCTableSize`, and `ODBCQuerySize` open remote connections.
+Their SQL functions are revoked from `PUBLIC`, require explicit `EXECUTE`, and
+also require `USAGE` on the named foreign server.
+
+Set-returning metadata functions execute their ODBC catalog call once and
+fetch the existing cursor across calls. Do not restart the remote operation for
+each returned row.
+
+## Build
 
 ```sh
 make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 sudo make install USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 ```
 
-`USE_PGXS=1` is inert at this release (the Makefile includes `--pgxs`
-unconditionally) and is kept because it is the documented invocation and a flag
-that does nothing costs nothing.
+The official PostgreSQL runtime image does not contain server headers.
+`postgresql-server-dev-18` supplies PGXS and server headers; `unixodbc-dev`
+supplies the ODBC headers and link library.
 
-**On Debian the PGDG paths apply, not `/usr/local`.** `pg_config` is at
-`/usr/lib/postgresql/18/bin/pg_config`, pkglibdir `/usr/lib/postgresql/18/lib`,
-sharedir `/usr/share/postgresql/18`. Only the *Alpine* PostgreSQL images build
-from source into `/usr/local`. **The official `postgres:18-*` image ships the
-server but no development headers**, so `postgresql-server-dev-18` is required
-or `pg_config.h` and the pgxs makefiles are simply absent.
+Do not suppress new compiler warnings. The supported Docker build is clean with
+the PGXS warning set under both GCC and Clang.
 
-`unixodbc-dev` supplies `libodbc.so` and the ODBC headers for
-`SHLIB_LINK = -lodbc`. The runtime package on Debian 13 is `libodbc2`;
-`libodbc1` has no candidate there.
+`ldd` proves only that linked dependencies resolve. Individual ODBC drivers are
+loaded dynamically at connection time. Verify registration with
+`odbcinst -q -d` and execute a real scan before claiming a driver works.
 
-**Never suppress a warning to get a clean build.** The build is clean at
-`-Wall` with PGXS's full flag set as of this release, and that is the baseline:
-a new warning is a defect in the new code.
+## Tests
 
-## Testing
-
-**Use Docker for all builds and tests.** `make docker-build` builds the fixed
-PostgreSQL 18 tool image, `make docker-shell` opens it with the checkout mounted,
-and `make docker-test` runs the credential-free psqlODBC smoke test. The smoke
-test compiles and installs the extension, starts a disposable PostgreSQL
-instance, connects back into it through a real ODBC driver, checks a scan and an
-import, checks that the validator refuses a malformed ceiling, that each of the
-three ceilings refuses at its boundary *while the same scan succeeds under the
-other two*, that a table cannot raise its server's ceiling, that a rescanned
-scan restarts, and carries a missing-symbol negative control. It is the ordinary
-development gate. **Building the image is not offline** — it fetches SAP's HANA
-client — so a network failure there is a build failure, not a test failure.
-
-**The HANA probe is opt-in and its configuration is local only.** `.env.example`
-is the committed template; `.env` is gitignored and holds the tenant hostname,
-credentials and a dedicated existing `HANA_SCHEMA`. The seed creates, replaces
-or removes only the three `ODBC_FDW_*` fixture tables in that schema; it never
-creates or drops a schema. The Dockerfile bakes only the two pinned,
-checksum-verified HANA libraries into the development image; do not move the
-version or its digests into `.env`, and do not log a tenant value. Run
-`make docker-hana-seed` before `make docker-hana`; the latter verifies direct
-and imported reads, query tables, large values, rescan behaviour, limits and the
-zero-column refusal. A new observed defect still belongs in README and a commit
-body.
-
-**`test/` is upstream's harness and it needs a LIVE ODBC source** — MySQL, SQL
-Server, Hive or PostgreSQL registered in `odbcinst.ini`, with fixtures loaded
-and a connector config that upstream's CI decrypted from
-`test/config/configs.tar.enc` using a key we do not have. So `make installcheck`
-and `make integration_tests` do **not** run on a workstation, `REGRESS` cannot
-be a gate here, and `.travis.yml` / `.appveyor.yml` describe infrastructure we
-do not operate. Do not restructure any of it to make it pass; say it needs a
-source instead. It is kept because it is the only description of what a
-multi-driver test would cover.
-
-**What IS runnable, with nothing but Docker.** psqlODBC pointed back at the
-container's own PostgreSQL is a real ODBC remote, and it exercises the whole
-path — validator, handler, `IMPORT FOREIGN SCHEMA`, the chunked read and the
-ceilings:
+Docker is the supported development environment:
 
 ```sh
-# postgres:18-trixie + headers + driver manager + psqlODBC
-apt-get install -y build-essential postgresql-server-dev-18 unixodbc-dev odbc-postgresql
-odbcinst -q -d          # must list [PostgreSQL Unicode]
+make docker-build
+make docker-shell
+make docker-test
+make docker-test-all
 ```
 
-```sql
-CREATE SERVER src FOREIGN DATA WRAPPER odbc_fdw OPTIONS (
-  odbc_driver 'PostgreSQL Unicode', odbc_servername '127.0.0.1',
-  odbc_port '5432', odbc_database 'remotedb');
-CREATE USER MAPPING FOR PUBLIC SERVER src
-  OPTIONS (odbc_uid 'postgres', odbc_pwd '<throwaway>');
-IMPORT FOREIGN SCHEMA rem LIMIT TO ("small") FROM SERVER src INTO ext;
-```
+The credential-free suite builds and installs the extension, starts disposable
+local databases, and reaches one through a real ODBC driver. It covers loading,
+imports, scans, identifier mapping, binary values, bound parameters, limits,
+rescans, cancellation, handle cleanup, and a repeated 1,000,000-row transfer.
 
-Two things that harness establishes and no reasoning could:
+Additional integration suites use external databases. They are opt-in, read
+credentials only from the gitignored `.env`, and operate only on dedicated
+fixture tables. Keep product-specific configuration, grants, driver versions,
+and architecture constraints in those executable test directories, the
+Dockerfile, Compose configuration, Makefile, and `.env.example`.
 
-- **The defects are not HANA-specific.** Against psqlODBC, stock `ee741f5`
-  returns NULL for a correctly-declared column whose remote spelling is upper
-  case, and a foreign table with more columns than its query returns
-  **terminates the backend with signal 11** and takes the instance into crash
-  recovery. Both are correct on this release. Keep that A/B in reach: build the
-  base commit's `.so`, install it over ours, run the probe in a fresh session
-  (each backend loads the library on first use), and reinstall.
-- **A negative control for symbol resolution.** `CREATE EXTENSION` resolves
-  `LANGUAGE C` symbols eagerly while `check_function_bodies` is on, which is
-  what makes its success evidence. Prove the check is live before trusting it:
-  `CREATE FUNCTION f() RETURNS void AS '$libdir/odbc_fdw', 'no_such_symbol'
-  LANGUAGE C;` must fail with `could not find function`.
+The inherited regression harness also requires configured live sources and
+fixture data from infrastructure this repository does not have. Do not claim
+`make installcheck` as a standalone gate.
 
-**A test must be able to fail, and a check must be able to fail for the RIGHT
-reason.** Asserting `CREATE EXTENSION` succeeds proves nothing without the
-negative control above; asserting a ceiling fires proves nothing unless the same
-scan is also shown to succeed without it.
+Every regression check needs a negative control or a paired success case that
+proves it can fail for the intended reason.
+
+## Versioning
+
+The annotated git tag and `default_version` are identical. A release also keeps
+the base SQL filename, Makefile `DATA`, README, changelog, and upgrade path aligned.
+
+Use semantic versioning:
+
+- patch for a C-only fix;
+- minor for an additive option or feature;
+- major for a breaking behavior change.
+
+Every release has a base SQL script and an upgrade script from the previous
+release. An empty upgrade script is correct for a C-only change. Never require
+operators to drop the extension merely because an upgrade file was omitted;
+dropping can cascade to foreign tables and dependent views.
+
+Do not reuse the upstream control-file version `0.5.2`. It identifies stock
+builds with different behavior and cannot safely identify this distribution.
+
+Never rename `odbc_fdw`, `odbc_fdw.so`, `odbc_fdw_handler`, or
+`odbc_fdw_validator`; downstream installations and PostgreSQL catalogs depend
+on those interface names.
+
+## Licence and provenance
+
+Keep the upstream lineage and every existing copyright notice.
+
+- `LICENSE` grant text stays byte-identical.
+- Softinent's notice applies only to files it substantially modifies and sits
+  beside, never in place of, existing notices.
+- Files do not all carry the same historical notices; do not normalize them.
+- README provenance is part of the public documentation, not optional history.
 
 ## Conventions
 
-- **Measurements go in the commit body.** These messages are the only record of
-  how several defects were diagnosed, and they are worth more than the diff. Say
-  what was measured, how, and what it rules out — including negative results,
-  which is why there is no interrupt check at the row boundary.
-- **Label an inference as an inference.** "Presumably", "not tested", "read from
-  the source but not run" are all acceptable; asserting an unverified claim is
-  not. `SQL_BINARY` is documented as *presumably* affected by the
-  `SQL_VARBINARY` defect because it was never tested.
-- **Conventional Commits**: `type(scope)!: subject`, imperative, no trailing
-  period, header ≤ 72 characters, then a blank line and a prose body wrapped at
-  80. `!` and a `BREAKING CHANGE:` footer mean an existing installation needs an
-  operator action.
-- **Ported commits keep their original messages.** The nine commits from
-  `ee741f5` to the first Softinent commit were cherry-picked, not rewritten.
-- **Commits carry no AI attribution** — no `Co-Authored-By`, no "generated with"
-  line. The provenance that matters is in the copyright headers and the README.
-- **Keep the diff justifiable line by line.** Nothing is reformatted, restructured
-  or tidied, deliberately, so that every divergence from upstream can be offered
-  as a pull request on its own. Upstream's brace style and tabs are upstream's;
-  match the surrounding code rather than the file you would have written.
-- **Do not commit a credential, a hostname, or a schema name from any real
-  system.** There is no tenant here and none is needed: the driver is loaded at
-  connect time, so everything short of an actual remote query can be proven with
-  psqlODBC. One inherited artefact is credential-shaped and is left alone
-  because it is upstream's and undecryptable —
-  `test/config/configs.tar.enc`, plus an AppVeyor `secure:` blob — but nothing
-  new joins it.
+- Use Conventional Commits: `type(scope)!: subject`, imperative, no trailing
+  period, header at most 72 characters.
+- Put measurements and negative results in commit bodies.
+- Label untested conclusions as inferences.
+- Preserve surrounding C style and tabs; avoid unrelated formatting.
+- Ported commits keep their original messages.
+- Commits carry no AI attribution.
+- Never commit credentials, real hostnames, or real schema names.

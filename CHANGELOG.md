@@ -34,6 +34,11 @@ Fixed — metadata, planning, and data correctness:
 - ODBC metadata returns are checked, identifier buffers include their terminator,
   column sizes are read without width mismatch, and oversized row counts are
   refused instead of narrowed;
+- `SQLColumns.COLUMN_SIZE` is retrieved through its standard signed integer C
+  type, with negative driver sentinels treated as unknown size, rather than
+  requiring every driver to support an unsigned 64-bit conversion;
+- the oldest supported PostgreSQL API uses its pre-11 foreign-server ACL enum,
+  and wide-text conversion uses the UTF-8 length API available since 9.5;
 - `SQL_BINARY` and `SQL_VARBINARY` now join `SQL_LONGVARBINARY` as `bytea`, and
   `SQL_FLOAT` maps to `float8`;
 - ODBC diagnostic messages use bounded dynamic aggregation rather than repeated
@@ -84,21 +89,24 @@ Fixed — memory safety and wrong answers:
   not checked.
 
 Added:
+- a product-neutral `wide_char_mode` server/table option. It defaults to
+  `char`, preserving established `SQL_C_CHAR` behavior, and can select
+  `SQL_C_WCHAR` for drivers that require wide retrieval. The wide path accepts
+  both UTF-16 and UTF-32 `SQLWCHAR` layouts; a table setting overrides its
+  server. This cannot be selected reliably by probing because some drivers
+  return corrupt text rather than an error for the unsupported target.
 - connection-leak gates in both harnesses. Each counts only the remote sessions
   created by its own probe run around twenty refused scans and a PL/pgSQL
   subtransaction loop; both the aborted- and successful-inner-subtransaction
-  paths are covered. The HANA probe identifies its run with HANA's `APPLICATION`
-  session variable and counts the `SYS.M_SESSION_CONTEXT` rows carrying that
-  marker — a session variable surfaces there as a `KEY`/`VALUE` row, and
-  `M_CONNECTIONS` has no client-application column at all, so an earlier draft
-  of this gate selected a column that does not exist and could only ever report
-  "could not read". Both gates were confirmed to fail against the code they were
-  written for. Against a live tenant, twenty refused scans move the marked
+  paths are covered. The live-driver probe identifies its own connections with
+  a per-run application marker and counts those sessions through the remote
+  monitoring interface. Both gates were confirmed to fail against the code they
+  were written for. Against a live database, twenty refused scans move the marked
   session count by **0** with the handle-lifetime fix in place and by exactly
-  **20** with the release path stubbed out. The tenant gate also carries a
+  **20** with the release path stubbed out. The live-driver gate also carries a
   control on its own instrument: it counts the marker while a second marked
   connection is held open by a cursor, and refuses to report anything if it
-  cannot see both. Without that, a marker that stopped reaching the tenant, or
+  cannot see both. Without that, a marker that stopped reaching the database, or
   an account that could see only its own session, would make every delta below
   it read as a clean run.
 - a backend-growth check over 200 successful scans, and an empty-remote-result
@@ -107,24 +115,22 @@ Added:
   size, and the instrument matters: resident set from `/proc/self/statm` rather
   than `pg_backend_memory_contexts`, because the ODBC driver allocates inside
   the backend where PostgreSQL's context accounting cannot see it. Measured,
-  two identical million-row passes differ by 40,960–65,536 bytes through
-  psqlODBC and 241,664–282,624 bytes through SAP's libodbcHDB against a real
-  tenant. Both are ranges because both move between runs — allocator
+  repeated million-row passes differ by 40,960–282,624 bytes across the tested
+  drivers. This is a range because the result moves between runs — allocator
   granularity, not a trend, and quoting either as one exact figure would claim a
   reproducibility the measurements do not have. Around a quarter of a byte per
   row, so the difference is the driver's working set and not a per-row cost.
   The gate refuses anything above 4MB. Each pass checks `sum(id)` against
   `n(n+1)/2` so a short scan cannot pass as a complete one, and the same fixture
   checks the `max_row_count` boundary on both sides and a `statement_timeout`
-  part-way through — those two in the loopback harness only; the tenant gate
+  part-way through — those two in the loopback harness only; the live-driver gate
   does the transfer and the resident-set comparison and nothing else. Opt-in
-  against a tenant through `HANA_BULK_ROWS`, and reported as skipped rather than
-  passed when unset.
+  against an external database, and reported as skipped rather than passed when
+  unset.
 
-Open — measured against a real HANA 2.0 tenant on 2026-08-14, NOT yet fixed here.
-Both are against released `1.0.0`, and neither is touched by the work above; the
-type matrix that found them is recorded in `dwh`'s `ODBC_FDW_DATA_OK`, which
-WITHDREW `1.0.0` from its allowlist on the strength of the first one:
+Open — measured against a live ODBC source on 2026-08-14, NOT yet fixed here.
+This is against released `1.0.0`; the type matrix that found it is recorded in
+`dwh`'s `ODBC_FDW_DATA_OK`, which WITHDREW `1.0.0` from its allowlist:
 
 - **`DECIMAL` is silently truncated, and the loss is invisible downstream.** A
   value survives only if its full text rendering — digits, plus a sign if
@@ -140,17 +146,6 @@ WITHDREW `1.0.0` from its allowlist on the strength of the first one:
   digit short, so the value reads as a tenth of the truth. Precision <= 30 is
   always safe; >= 31 depends on sign and magnitude. Sizing at `precision + 3`
   covers it.
-- **`NVARCHAR` holding any non-ASCII fails the whole scan.** `target_type` is
-  `SQL_C_CHAR` for every non-binary column, so SAP's driver is asked to convert
-  NVARCHAR to ASCII and refuses: `-10427 Conversion of parameter/column (N) from
-  data type NVARCHAR to ASCII failed`. The `encoding` server option cannot help,
-  because `pg_any_to_server` runs on bytes the driver never produced. Verified in
-  both directions that a `CHAR_AS_UTF8=TRUE` connection attribute fixes it — every
-  non-ASCII shape then reads correctly, including supplementary-plane characters,
-  which HANA stores as CESU-8 (`U+1F600` is `ED A0 BD ED B8 80` on disk) and the
-  driver converts to proper UTF-8. That is a per-connection workaround a caller
-  has to know about; binding `SQL_C_WCHAR` would fix it here instead. Loud rather
-  than silent, so it reads as a broken source rather than as wrong numbers.
 
 Two smaller findings from the same run, both fixed by the type-mapping change
 above but recorded because they were measured on the released build: `DOUBLE`
@@ -173,8 +168,8 @@ First Softinent release, derived from `devrimgunduz/odbc_fdw` at `ee741f5`
 (its tag `0.6.1`, whose control file declared `0.5.2`). From here the git tag
 and `default_version` are one string.
 
-Fixed, each measured against a real SAP HANA 2.0 tenant and, for the first two,
-independently reproduced against psqlODBC:
+Fixed, each reproduced against a live ODBC source and, for the first two,
+independently against the credential-free loopback harness:
 - an empty `SQL_CATALOG_NAME_SEPARATOR` produced one malformed identifier
   instead of `schema.table`;
 - `values[]` was sized by result columns, indexed by foreign-table position and
@@ -269,7 +264,7 @@ Announcements:
 - Added CONTRIBUTING.md document
 - Added an `.editorconfig` file to help enforce formatting of c/h/sql/yml files 222b39a
 - Applied bulk formatting pass to get everything lined up d53480e
-- Added this NEWS.md file
+- Added this changelog file
 - Added a release procedure in HOWTO_RELEASE.md file
 
 

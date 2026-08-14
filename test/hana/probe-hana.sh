@@ -86,7 +86,7 @@ fi
 
 assertions=(
     direct_scalar direct_time direct_timestamp direct_unicode_null import_types
-    type_matrix type_matrix_nulls import_type_matrix import_binary_boundary
+    type_matrix type_matrix_nulls import_type_matrix import_binary
     ascii_text cyrillic_text utf8_text json_direct json_import json_nulls
     direct_case_names import_case_names sql_query parameter_in_out large_value
     rescan

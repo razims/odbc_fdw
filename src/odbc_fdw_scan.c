@@ -196,6 +196,88 @@ find_table_column(StringInfoData *table_columns, int num_columns,
 	return -1;
 }
 
+/* Convert SQL_C_WCHAR code units to the PostgreSQL server encoding. */
+static char *
+wide_text_to_server(const char *buffer, int byte_len)
+{
+	const SQLWCHAR *wide = (const SQLWCHAR *) buffer;
+	size_t unit_width = sizeof(SQLWCHAR);
+	size_t units;
+	size_t i;
+	unsigned char *utf8;
+	unsigned char *cursor;
+	char *server;
+
+	/* Driver managers use either UTF-16 or UTF-32 SQLWCHAR code units. */
+	if (unit_width != 2 && unit_width != 4)
+		ereport(ERROR,
+		        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		         errmsg("odbc_fdw: this build uses an unsupported SQLWCHAR width"),
+		         errdetail("SQLWCHAR is %lu bytes; expected 2 or 4.",
+		                   (unsigned long) unit_width)));
+	if (byte_len < 0 || byte_len % (int) unit_width != 0)
+		ereport(ERROR,
+		        (errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+		         errmsg("odbc_fdw: ODBC driver returned malformed wide-character data"),
+		         errdetail("The byte length %d is not aligned to %lu-byte SQLWCHAR units.",
+		                   byte_len, (unsigned long) unit_width)));
+
+	units = (size_t) byte_len / unit_width;
+	if (units > (MaxAllocSize - 1) / 4)
+		ereport(ERROR,
+		        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+		         errmsg("odbc_fdw: wide-character value is too large to convert")));
+	utf8 = (unsigned char *) palloc(units * 4 + 1);
+	cursor = utf8;
+
+	for (i = 0; i < units; i++)
+	{
+		pg_wchar codepoint = wide[i];
+
+		if (unit_width == 2 && codepoint >= 0xD800 && codepoint <= 0xDBFF)
+		{
+			pg_wchar low;
+
+			if (++i >= units)
+				ereport(ERROR,
+				        (errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+				         errmsg("odbc_fdw: ODBC driver returned malformed UTF-16"),
+				         errdetail("A high surrogate was not followed by a low surrogate.")));
+			low = wide[i];
+			if (low < 0xDC00 || low > 0xDFFF)
+				ereport(ERROR,
+				        (errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+				         errmsg("odbc_fdw: ODBC driver returned malformed UTF-16"),
+				         errdetail("A high surrogate was not followed by a low surrogate.")));
+			codepoint = 0x10000 + ((codepoint - 0xD800) << 10)
+			            + (low - 0xDC00);
+		}
+		else if (codepoint >= 0xD800 && codepoint <= 0xDFFF)
+			ereport(ERROR,
+			        (errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+			         errmsg("odbc_fdw: ODBC driver returned malformed wide-character data"),
+			         errdetail("A Unicode surrogate appeared outside a valid UTF-16 pair.")));
+		else if (codepoint > 0x10FFFF)
+			ereport(ERROR,
+			        (errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+			         errmsg("odbc_fdw: ODBC driver returned malformed wide-character data"),
+			         errdetail("Code point U+%08X is outside the Unicode range.",
+			                   codepoint)));
+		else if (codepoint == 0)
+			ereport(ERROR,
+			        (errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+			         errmsg("odbc_fdw: ODBC wide-character data contains a zero code point")));
+
+		unicode_to_utf8(codepoint, cursor);
+		cursor += pg_utf_mblen(cursor);
+	}
+	*cursor = '\0';
+	server = pg_any_to_server((char *) utf8, (int) (cursor - utf8), PG_UTF8);
+	if (server != (char *) utf8)
+		pfree(utf8);
+	return server;
+}
+
 static const char * HEX_DIGITS = "0123456789ABCDEF";
 
 static char * binary_to_hex(char * buffer, int buffer_size)
@@ -648,8 +730,8 @@ odbcIterateForeignScan(ForeignScanState *node)
 	 * ever driven from there (odbcAnalyzeForeignTable returns false, so
 	 * ANALYZE does not sample, and IterateForeignScan has no other caller).
 	 *
-	 * Measured with statement_timeout = 5s against a real SAP HANA 2.0
-	 * tenant, on a 3,000,000-row remote scan, with no check in this function
+	 * Measured with statement_timeout = 5s against a live ODBC source on a
+	 * 3,000,000-row remote scan, with no check in this function
 	 * at all -- three shapes chosen to put the per-tuple loop in three
 	 * different places: COPY of every row (many output tuples), count(*)
 	 * (one output tuple), and a non-pushed-down qual matching nothing (zero
@@ -735,7 +817,20 @@ odbcIterateForeignScan(ForeignScanState *node)
 			{
 				conversion = BIN_CONVERSION;
 			}
-			if (strcmp("boolean", (char*)sql_type.data) == 0)
+			else if (festate->options.use_wide_char &&
+			         (DataTypePtr == SQL_WCHAR ||
+			          DataTypePtr == SQL_WVARCHAR ||
+			          DataTypePtr == SQL_WLONGVARCHAR))
+			{
+				/*
+				 * Match ODBC wide SQL types to the standard wide C target.
+				 * The server option is explicit because drivers disagree here
+				 * and some return corrupt text rather than an error for the
+				 * unsupported choice, making automatic fallback unsafe.
+				 */
+				conversion = WIDE_TEXT_CONVERSION;
+			}
+			else if (strcmp("boolean", (char*)sql_type.data) == 0)
 			{
 				conversion = BOOL_CONVERSION;
 			}
@@ -824,13 +919,13 @@ odbcIterateForeignScan(ForeignScanState *node)
 		 * uninitialised for BuildTupleFromCStrings to dereference as a C
 		 * string.
 		 *
-		 * That single read of uninitialised heap is the entire measured
-		 * symptom set against HANA: 'ABCDEFGH' arriving empty, SYS.TABLES
-		 * schema names arriving as a stray \x03 and as blanks with the row
+		 * That single read of uninitialised heap explained the entire measured
+		 * symptom set: 'ABCDEFGH' arriving empty, remote catalog schema names
+		 * arriving as a stray \x03 and as blanks with the row
 		 * COUNT still correct, 424242 failing with "invalid input syntax for
 		 * integer", and an intermittent SIGSEGV that took the whole instance
-		 * into crash recovery and appeared to depend on which HANA client
-		 * libraries were installed -- because that changed the heap layout,
+		 * into crash recovery and appeared to depend on which client libraries
+		 * were installed -- because that changed the heap layout,
 		 * not the bug. A zeroed slot is a SQL NULL, which is the honest
 		 * answer for a column the remote query did not return.
 		 */
@@ -846,16 +941,24 @@ odbcIterateForeignScan(ForeignScanState *node)
 			SQLSMALLINT target_type = SQL_C_CHAR;
 			SQLLEN result_size;
 			int chunk_size, effective_chunk_size;
+			int terminator_size = 1;
 			int buffer_size = 0;
 			char * buffer = 0;
 			char * hex;
 			int used_buffer_size = 0;
 			GetDataTruncation truncation;
 			bool binary_data = false;
+			bool wide_data = false;
 			if (conversion == BIN_CONVERSION)
 			{
 				target_type	= SQL_C_BINARY;
 				binary_data = true;
+			}
+			else if (conversion == WIDE_TEXT_CONVERSION)
+			{
+				target_type = SQL_C_WCHAR;
+				terminator_size = sizeof(SQLWCHAR);
+				wide_data = true;
 			}
 
 			if (col_size == 0)
@@ -863,7 +966,16 @@ odbcIterateForeignScan(ForeignScanState *node)
 				col_size = 1024;
 			}
 
-			chunk_size = binary_data ? col_size : col_size + 1;
+			if (wide_data)
+			{
+				if (col_size > (PG_INT32_MAX / (int) sizeof(SQLWCHAR)) - 1)
+					ereport(ERROR,
+					        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					         errmsg("odbc_fdw: wide-character column is too large to buffer")));
+				chunk_size = (col_size + 1) * sizeof(SQLWCHAR);
+			}
+			else
+				chunk_size = binary_data ? col_size : col_size + 1;
 
 			/* Ignore this column if position is marked as invalid */
 			if (mapped_pos == -1)
@@ -878,7 +990,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 				 * per-tuple check cannot reach: a LOB arrives in
 				 * MAXIMUM_BUFFER_SIZE chunks, so Iterate is entered ONCE for
 				 * the row and stays here for the whole value. Measured against
-				 * a real SAP HANA 2.0 tenant on a single row holding one
+				 * a live ODBC source on a single row holding one
 				 * 60,000,000-character NCLOB, with this check absent: the read
 				 * took 9.94s unbounded, and a pg_cancel_backend() issued 2.01s
 				 * in did not stop it for a further 11.15s -- that is, not until
@@ -941,8 +1053,8 @@ odbcIterateForeignScan(ForeignScanState *node)
 					 * SEVERAL SQLGetData calls only for character and binary
 					 * source types. Any other type rendered to SQL_C_CHAR gets
 					 * ONE call: the driver truncates, reports 01004 with the full
-					 * length, and then has no continuation to give. Measured
-					 * against SAP HANA, CURRENT_TIMESTAMP is exactly that -- a
+					 * length, and then has no continuation to give. With one tested
+					 * driver, CURRENT_TIMESTAMP is exactly that -- a
 					 * driver-reported column size of 27 against a 29-byte
 					 * rendering:
 					 *   chunk=28 ret=1 rsize=29 state=01004   (27 bytes copied)
@@ -959,8 +1071,12 @@ odbcIterateForeignScan(ForeignScanState *node)
 					 * the FIRST call, breaking without this would hand
 					 * appendStringInfoString an uninitialised buffer.
 					 */
-					resize_buffer(&buffer, &buffer_size, used_buffer_size, used_buffer_size + 1);
-					buffer[used_buffer_size] = 0;
+					if (!wide_data)
+					{
+						resize_buffer(&buffer, &buffer_size, used_buffer_size,
+						              used_buffer_size + 1);
+						buffer[used_buffer_size] = 0;
+					}
 					ret = SQL_SUCCESS;
 					break;
 				}
@@ -985,7 +1101,8 @@ odbcIterateForeignScan(ForeignScanState *node)
 				 * exactly chunk_size - 1 bytes of data. Binary data is not
 				 * terminated and uses the whole chunk.
 				 */
-				effective_chunk_size = binary_data ? chunk_size : chunk_size - 1;
+				effective_chunk_size = binary_data ? chunk_size
+				                                      : chunk_size - terminator_size;
 				truncation = result_truncation(ret, stmt);
 				if (truncation == STRING_TRUNCATION)
 				{
@@ -1022,7 +1139,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 						// wait, maybe we don't need to read, just append a zero!
 						if (chunk_size == 0)
 						{
-							if (!binary_data)
+							if (!binary_data && !wide_data)
 							{
 								/*
 								 * Writes at used_buffer_size - 1, so it needs at
@@ -1042,7 +1159,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 						}
 						if (!binary_data)
 						{
-							chunk_size += 1;
+							chunk_size += terminator_size;
 						}
 					}
 				}
@@ -1066,8 +1183,8 @@ odbcIterateForeignScan(ForeignScanState *node)
 					 * result_size is an INDICATOR, not always a length:
 					 * SQL_NULL_DATA (-1) for a NULL value, SQL_NO_TOTAL (-4)
 					 * when the driver will not say. Adding it unchecked drove
-					 * used_buffer_size NEGATIVE, and the
-					 * strnlen(buffer, used_buffer_size) below then ran with a
+					 * used_buffer_size NEGATIVE, and the bounded string scan below
+					 * then ran with a
 					 * (size_t)-1 bound -- an out-of-bounds scan on every NULL
 					 * value, which the SQL_NULL_DATA test further down was too
 					 * late to prevent. Clamping to chunk_size keeps the total
@@ -1080,9 +1197,10 @@ odbcIterateForeignScan(ForeignScanState *node)
 				}
 			} while (truncation == STRING_TRUNCATION && chunk_size > 0);
 
-			if (!binary_data)
+			if (!binary_data && !wide_data)
 			{
-				used_buffer_size = strnlen(buffer, used_buffer_size);
+				used_buffer_size = odbc_bounded_strlen(buffer,
+				                                       used_buffer_size);
 			}
 
 			/*
@@ -1133,7 +1251,16 @@ odbcIterateForeignScan(ForeignScanState *node)
 				}
 				else
 				{
-					if (festate->encoding != -1 && !binary_data)
+					if (wide_data)
+					{
+						char *converted = wide_text_to_server(buffer,
+						                                      used_buffer_size);
+
+						pfree(buffer);
+						buffer = converted;
+						used_buffer_size = strlen(buffer);
+					}
+					else if (festate->encoding != -1 && !binary_data)
 					{
 						/* Convert character encoding */
 						buffer = pg_any_to_server(buffer, used_buffer_size, festate->encoding);
@@ -1142,6 +1269,7 @@ odbcIterateForeignScan(ForeignScanState *node)
 					switch (conversion)
 					{
 					case TEXT_CONVERSION :
+					case WIDE_TEXT_CONVERSION :
 						appendStringInfoString (&col_data, buffer);
 						break;
 					case BOOL_CONVERSION :

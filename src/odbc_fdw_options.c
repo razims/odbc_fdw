@@ -38,6 +38,7 @@ static struct odbcFdwOption valid_options[] =
 	{ "dsn",        ForeignServerRelationId },
 	{ "driver",     ForeignServerRelationId },
 	{ "encoding",   ForeignServerRelationId },
+	{ "wide_char_mode", ForeignServerRelationId },
 
 	/* Foreign table options */
 	{ "schema",     ForeignTableRelationId },
@@ -45,6 +46,7 @@ static struct odbcFdwOption valid_options[] =
 	{ "prefix",     ForeignTableRelationId },
 	{ "sql_query",  ForeignTableRelationId },
 	{ "sql_count",  ForeignTableRelationId },
+	{ "wide_char_mode", ForeignTableRelationId },
 
 	/*
 	 * Resource ceilings, valid on a server and on a table. Listed for both
@@ -127,22 +129,7 @@ get_odbc_attribute_name(const char* defname)
 	int offset = is_odbc_attribute(defname) ? odbc_attribute_prefix_len : 0;
 	const char *attribute_name = defname + offset;
 
-	/*
-	 * PostgreSQL option names are identifiers and cannot contain the colon used
-	 * by SAP HANA's sessionVariable:<key> connection properties. Keep the
-	 * ordinary odbc_<property> pass-through convention, with this spelling for
-	 * the one useful colon-form property: odbc_sessionvariable_application.
-	 *
-	 * pg_strcasecmp, as in normalized_attribute() below. This is an identifier
-	 * comparison, and strcasecmp folds case according to LC_CTYPE, which
-	 * PostgreSQL sets from the database: a double-quoted
-	 * "odbc_SESSIONVARIABLE_APPLICATION" -- the one spelling that survives
-	 * PostgreSQL's own down-folding with its case intact -- could stop matching
-	 * here under a locale that maps 'I' elsewhere, and an unmatched foreign
-	 * table option is not an error, it becomes a COLUMN NAME MAPPING. A hazard
-	 * rather than a measured defect: no failing case was reproduced. Costs
-	 * nothing to remove.
-	 */
+	/* Retain the released 1.0.x spelling while quoted names use direct pass-through. */
 	if (pg_strcasecmp(attribute_name, "sessionvariable_application") == 0)
 		return "sessionVariable:APPLICATION";
 
@@ -184,6 +171,23 @@ apply_limit_option(DefElem *def, int64 *limit)
 
 	if (parsed > 0 && (*limit == 0 || parsed < *limit))
 		*limit = parsed;
+}
+
+static bool
+parse_wide_char_mode(DefElem *def)
+{
+	const char *value = defGetString(def);
+
+	if (pg_strcasecmp(value, "char") == 0)
+		return false;
+	if (pg_strcasecmp(value, "wchar") == 0)
+		return true;
+
+	ereport(ERROR,
+	        (errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
+	         errmsg("option \"%s\" requires \"char\" or \"wchar\", got \"%s\"",
+	                def->defname, value)));
+	return false;
 }
 
 void
@@ -245,6 +249,17 @@ extract_odbcFdwOptions(List *options_list, odbcFdwOptions *extracted_options)
 		if (strcmp(def->defname, "encoding") == 0)
 		{
 			extracted_options->encoding = defGetString(def);
+			continue;
+		}
+
+		if (strcmp(def->defname, "wide_char_mode") == 0)
+		{
+			/* Table/additional options precede server options: first wins. */
+			if (!extracted_options->wide_char_mode_set)
+			{
+				extracted_options->use_wide_char = parse_wide_char_mode(def);
+				extracted_options->wide_char_mode_set = true;
+			}
 			continue;
 		}
 
@@ -371,6 +386,9 @@ odbc_fdw_validator(PG_FUNCTION_ARGS)
 			int64 sink = 0;
 			apply_limit_option(def, &sink);
 		}
+
+		if (strcmp(def->defname, "wide_char_mode") == 0)
+			(void) parse_wide_char_mode(def);
 
 		/* TODO: detect redundant connection attributes and missing required attributs (dsn or driver)
 		 * Complain about redundent options

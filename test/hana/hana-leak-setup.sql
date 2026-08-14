@@ -11,7 +11,7 @@
 -- literal while the FDW still receives the complete query as its sql_query
 -- option value.
 -- M_SESSION_CONTEXT, not M_CONNECTIONS. The marker is set as the HANA session
--- variable APPLICATION (see odbc_sessionvariable_application on the server),
+-- variable APPLICATION (see the quoted pass-through option on the server),
 -- and a session variable surfaces as a KEY/VALUE row in M_SESSION_CONTEXT --
 -- M_CONNECTIONS has no column carrying it. Selecting a column that does not
 -- exist makes the whole count query fail, which the harness sees as "could not

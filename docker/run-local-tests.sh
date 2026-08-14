@@ -187,6 +187,10 @@ if psql_local fdwtest -c "CREATE SERVER invalid_limit FOREIGN DATA WRAPPER odbc_
     fail 'the validator accepted an invalid max_row_count'
 fi
 
+if psql_local fdwtest -c "CREATE SERVER invalid_wide_mode FOREIGN DATA WRAPPER odbc_fdw OPTIONS (wide_char_mode 'auto')" >/dev/null 2>&1; then
+    fail 'the validator accepted an invalid wide_char_mode'
+fi
+
 psql_local fdwtest -c "ALTER FOREIGN TABLE ext.small OPTIONS (ADD max_field_size '10')" >/dev/null
 if psql_local fdwtest -c 'SELECT big FROM ext.small' >/dev/null 2>&1; then
     fail 'max_field_size did not refuse the oversized field'

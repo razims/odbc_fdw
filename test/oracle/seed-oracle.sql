@@ -1,0 +1,118 @@
+DROP TABLE "@SCHEMA@"."ODBC_FDW_DATA_TYPES" PURGE;
+DROP TABLE "@SCHEMA@"."ODBC_FDW_LARGE_VALUES" PURGE;
+DROP TABLE "@SCHEMA@"."ODBC_FDW_SINGLE_ROW" PURGE;
+DROP TABLE "@SCHEMA@"."ODBC_FDW_TYPE_MATRIX" PURGE;
+DROP TABLE "@SCHEMA@"."ODBC_FDW_ENCODING_MATRIX" PURGE;
+DROP TABLE "@SCHEMA@"."ODBC_FDW_JSON_VALUES" PURGE;
+DROP TABLE "@SCHEMA@"."odbc_fdw_lower_table" PURGE;
+DROP TABLE "@SCHEMA@"."OdbcFdwMixedTable" PURGE;
+
+CREATE TABLE "@SCHEMA@"."ODBC_FDW_DATA_TYPES" (
+    "ID"              NUMBER(10, 0) PRIMARY KEY,
+    "TEXT_VALUE"      VARCHAR2(100),
+    "INTEGER_VALUE"   NUMBER(10, 0),
+    "DECIMAL_VALUE"   NUMBER(20, 4),
+    "DATE_VALUE"      DATE,
+    "TIMESTAMP_VALUE" TIMESTAMP(6),
+    "NULL_VALUE"      VARCHAR2(10),
+    "UNICODE_VALUE"   NVARCHAR2(100)
+);
+
+INSERT INTO "@SCHEMA@"."ODBC_FDW_DATA_TYPES" VALUES
+    (1, 'alpha', 42, 123.4500, DATE '2024-01-02',
+     TIMESTAMP '2024-01-02 03:04:05', NULL, N'Grüße');
+INSERT INTO "@SCHEMA@"."ODBC_FDW_DATA_TYPES" VALUES
+    (2, 'beta', -7, -0.0100, DATE '2024-12-31',
+     TIMESTAMP '2024-12-31 23:59:59', 'present', N'東京');
+
+CREATE TABLE "@SCHEMA@"."ODBC_FDW_LARGE_VALUES" (
+    "ID"          NUMBER(10, 0) PRIMARY KEY,
+    "CLOB_VALUE"  CLOB,
+    "NCLOB_VALUE" NCLOB,
+    "BLOB_VALUE"  BLOB
+);
+
+INSERT INTO "@SCHEMA@"."ODBC_FDW_LARGE_VALUES" VALUES
+    (1,
+     TO_CLOB(RPAD('x', 4000, 'x')) || TO_CLOB(RPAD('x', 2000, 'x')),
+     TO_NCLOB(N'unicode 東京'),
+     TO_BLOB(HEXTORAW('004142FF')));
+
+CREATE TABLE "@SCHEMA@"."ODBC_FDW_SINGLE_ROW" (
+    "ID"      NUMBER(10, 0) PRIMARY KEY,
+    "PAYLOAD" VARCHAR2(100)
+);
+INSERT INTO "@SCHEMA@"."ODBC_FDW_SINGLE_ROW" VALUES (1, 'rescan');
+
+CREATE TABLE "@SCHEMA@"."ODBC_FDW_TYPE_MATRIX" (
+    "ID"              NUMBER(10, 0) PRIMARY KEY,
+    "SMALL_VALUE"     NUMBER(5, 0),
+    "INTEGER_VALUE"   NUMBER(10, 0),
+    "BIGINT_VALUE"    NUMBER(19, 0),
+    "DECIMAL_VALUE"   NUMBER(18, 4),
+    "BINARY_FLOAT_VALUE"  BINARY_FLOAT,
+    "BINARY_DOUBLE_VALUE" BINARY_DOUBLE,
+    "CHAR_VALUE"      CHAR(6),
+    "NCHAR_VALUE"     NCHAR(6),
+    "VARCHAR_VALUE"   VARCHAR2(100),
+    "NVARCHAR_VALUE"  NVARCHAR2(100),
+    "DATE_VALUE"      DATE,
+    "TIMESTAMP_VALUE" TIMESTAMP(6),
+    "CLOB_VALUE"      CLOB,
+    "NCLOB_VALUE"     NCLOB,
+    "BLOB_VALUE"      BLOB,
+    "RAW_VALUE"       RAW(4)
+);
+
+INSERT INTO "@SCHEMA@"."ODBC_FDW_TYPE_MATRIX" VALUES
+    (1, -32768, 2147483647, 922337203685477580,
+     12345678901234.5678, 3.25, 1234567.125,
+     'abc', N'東京', 'plain varchar', N'Grüße 東京',
+     DATE '2024-06-30', TIMESTAMP '2024-06-30 12:34:56',
+     TO_CLOB('plain clob'), TO_NCLOB(N'unicode 東京'),
+     TO_BLOB(HEXTORAW('00FF1020')), HEXTORAW('ABCD1020'));
+INSERT INTO "@SCHEMA@"."ODBC_FDW_TYPE_MATRIX" VALUES
+    (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+     NULL, NULL, NULL, NULL, NULL, NULL);
+
+CREATE TABLE "@SCHEMA@"."ODBC_FDW_ENCODING_MATRIX" (
+    "ID"              NUMBER(10, 0) PRIMARY KEY,
+    "ASCII_VALUE"     VARCHAR2(100),
+    "CYRILLIC_VALUE"  NVARCHAR2(100),
+    "UTF8_VALUE"      NVARCHAR2(100),
+    "COMBINING_VALUE" NVARCHAR2(100)
+);
+INSERT INTO "@SCHEMA@"."ODBC_FDW_ENCODING_MATRIX" VALUES
+    (1, 'The quick brown fox 123 !@#$', N'Привет, мир — Ёжик',
+     N'Grüße 東京 😀', N'é');
+
+CREATE TABLE "@SCHEMA@"."ODBC_FDW_JSON_VALUES" (
+    "ID"               NUMBER(10, 0) PRIMARY KEY,
+    "JSON_VALUE"       NVARCHAR2(2000),
+    "JSON_NCLOB_VALUE" NCLOB
+);
+INSERT INTO "@SCHEMA@"."ODBC_FDW_JSON_VALUES" VALUES
+    (1,
+     N'{"owner":"София","tags":["ascii","東京","😀"],"active":true,"count":42}',
+     TO_NCLOB(N'{"document":{"title":"Привет","locale":"ru_RU"},"items":[{"id":1},{"id":2}],"unicode":"Grüße 東京 😀"}'));
+INSERT INTO "@SCHEMA@"."ODBC_FDW_JSON_VALUES" VALUES (2, NULL, NULL);
+
+CREATE TABLE "@SCHEMA@"."odbc_fdw_lower_table" (
+    "UPPER_VALUE"  NUMBER(10, 0),
+    "lower_value"  NVARCHAR2(100),
+    "MixedValue"   NVARCHAR2(100),
+    "Spaced Value" NVARCHAR2(100)
+);
+INSERT INTO "@SCHEMA@"."odbc_fdw_lower_table" VALUES
+    (1, N'lower column', N'mixed column', N'space column');
+
+CREATE TABLE "@SCHEMA@"."OdbcFdwMixedTable" (
+    "UPPER_VALUE"  NUMBER(10, 0),
+    "lower_value"  NVARCHAR2(100),
+    "MixedValue"   NVARCHAR2(100),
+    "Spaced Value" NVARCHAR2(100)
+);
+INSERT INTO "@SCHEMA@"."OdbcFdwMixedTable" VALUES
+    (2, N'lower mixed table', N'mixed mixed table', N'space mixed table');
+
+COMMIT;

@@ -45,10 +45,12 @@ endif
 
 DOCKER_GOALS = \
 	docker-build docker-shell docker-test docker-hana docker-hana-seed docker-hana-clean \
+	docker-oracle docker-oracle-seed docker-oracle-clean \
 	docker-test-amd64 docker-test-arm64 docker-test-all \
 	docker-hana-amd64 docker-hana-arm64 docker-hana-all \
 	docker-hana-seed-amd64 docker-hana-seed-arm64 \
-	docker-hana-clean-amd64 docker-hana-clean-arm64
+	docker-hana-clean-amd64 docker-hana-clean-arm64 \
+	docker-oracle-amd64 docker-oracle-seed-amd64 docker-oracle-clean-amd64
 NON_DOCKER_GOALS = $(filter-out $(DOCKER_GOALS),$(MAKECMDGOALS))
 
 # A Docker-only command must be usable on a host with no PostgreSQL headers or
@@ -77,13 +79,16 @@ DOCKER_COMPOSE ?= docker compose
 
 .PHONY: \
 	docker-build docker-shell docker-test docker-hana docker-hana-seed docker-hana-clean \
+	docker-oracle docker-oracle-seed docker-oracle-clean \
 	docker-test-amd64 docker-test-arm64 docker-test-all \
 	docker-hana-amd64 docker-hana-arm64 docker-hana-all \
 	docker-hana-seed-amd64 docker-hana-seed-arm64 \
-	docker-hana-clean-amd64 docker-hana-clean-arm64
+	docker-hana-clean-amd64 docker-hana-clean-arm64 \
+	docker-oracle-amd64 docker-oracle-seed-amd64 docker-oracle-clean-amd64
 
 # Docker is the supported development environment. The local smoke test needs
-# no credentials; the HANA suite is opt-in and reads the gitignored .env file.
+# no credentials; the HANA and Oracle suites are opt-in and read the gitignored
+# .env file.
 docker-build:
 	$(DOCKER_COMPOSE) build dev
 
@@ -147,3 +152,27 @@ docker-hana-clean-amd64:
 docker-hana-clean-arm64:
 	DOCKER_DEFAULT_PLATFORM=linux/arm64 $(DOCKER_COMPOSE) build hana-clean
 	DOCKER_DEFAULT_PLATFORM=linux/arm64 $(DOCKER_COMPOSE) run --rm hana-clean
+
+# Oracle uses a PDB service name (DBQ=//host:port/service), never an SID. Like
+# HANA, seeding and cleanup are explicit because they mutate a real remote test
+# database; the probe itself is read-only through odbc_fdw.
+docker-oracle:
+	$(DOCKER_COMPOSE) build oracle
+	$(DOCKER_COMPOSE) run --rm oracle
+
+docker-oracle-amd64:
+	$(MAKE) docker-oracle
+
+docker-oracle-seed:
+	$(DOCKER_COMPOSE) build oracle-seed
+	$(DOCKER_COMPOSE) run --rm oracle-seed
+
+docker-oracle-seed-amd64:
+	$(MAKE) docker-oracle-seed
+
+docker-oracle-clean:
+	$(DOCKER_COMPOSE) build oracle-clean
+	$(DOCKER_COMPOSE) run --rm oracle-clean
+
+docker-oracle-clean-amd64:
+	$(MAKE) docker-oracle-clean

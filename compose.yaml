@@ -42,3 +42,33 @@ services:
     env_file:
       - .env
     command: ["bash", "/workspace/test/hana/clean-hana.sh"]
+
+  oracle:
+    platform: linux/amd64
+    build:
+      context: .
+      target: oracle-test-runner
+    working_dir: /workspace
+    env_file:
+      - .env
+    command: ["bash", "/workspace/test/oracle/probe-oracle.sh"]
+
+  oracle-seed:
+    platform: linux/amd64
+    build:
+      context: .
+      target: oracle-test-runner
+    working_dir: /workspace
+    env_file:
+      - .env
+    command: ["bash", "/workspace/test/oracle/seed-oracle.sh"]
+
+  oracle-clean:
+    platform: linux/amd64
+    build:
+      context: .
+      target: oracle-test-runner
+    working_dir: /workspace
+    env_file:
+      - .env
+    command: ["bash", "/workspace/test/oracle/clean-oracle.sh"]

@@ -60,7 +60,7 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	SQLSMALLINT NameLength;
 	SQLSMALLINT DataType;
 	SQLULEN     ColumnSize;
-	SQLUBIGINT  ColumnSizeValue;
+	SQLINTEGER  ColumnSizeValue;
 	SQLSMALLINT DecimalDigits;
 	SQLSMALLINT Nullable;
 	int i;
@@ -375,21 +375,29 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 						         errmsg("ODBC column metadata returned a NULL data type")));
 
 					ColumnSizeValue = 0;
-					ret = SQLGetData(columns_stmt, 7, SQL_C_UBIGINT,
-					                 &ColumnSizeValue, sizeof(ColumnSizeValue), &indicator);
+					/*
+					 * SQLColumns defines COLUMN_SIZE (column 7) as SQL_INTEGER.
+					 * Retrieve the specified metadata type instead of relying on
+					 * a driver's optional conversion to an unsigned 64-bit type.
+					 */
+					ret = SQLGetData(columns_stmt, 7, SQL_C_SLONG,
+					                 &ColumnSizeValue, sizeof(ColumnSizeValue),
+					                 &indicator);
 					check_return(ret, "Reading column size", columns_stmt,
 					             SQL_HANDLE_STMT);
 					if (indicator == SQL_NULL_DATA)
 						ColumnSize = 0;
-					else
+					else if (ColumnSizeValue < 0)
 					{
-						if (sizeof(SQLULEN) < sizeof(SQLUBIGINT) &&
-						    ColumnSizeValue > (SQLUBIGINT) ((SQLULEN) -1))
-							ereport(ERROR,
-							        (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-							         errmsg("ODBC column size is too large")));
-						ColumnSize = (SQLULEN) ColumnSizeValue;
+						/*
+						 * Some drivers put a negative unknown/unbounded sentinel in
+						 * COLUMN_SIZE. Treat it like NULL metadata; the type mapper
+						 * already uses zero for an unspecified length.
+						 */
+						ColumnSize = 0;
 					}
+					else
+						ColumnSize = (SQLULEN) ColumnSizeValue;
 
 					ret = SQLGetData(columns_stmt, 9, SQL_C_SSHORT,
 					                 &DecimalDigits, sizeof(DecimalDigits), &indicator);
@@ -459,7 +467,7 @@ odbcImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			 * SQLTables, LIMIT TO takes the names verbatim from the parsed
 			 * statement and trusts them. PostgreSQL has already folded any
 			 * unquoted identifier to lower case by then, so against a remote
-			 * that folds UP -- SAP HANA, Oracle, DB2 -- or one with genuinely
+			 * that folds identifiers up or one with genuinely
 			 * mixed-case names,
 			 *   IMPORT FOREIGN SCHEMA "S" LIMIT TO (MixedTbl) ...
 			 * asks for "mixedtbl", which does not exist there. Measured: the
