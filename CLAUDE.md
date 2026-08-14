@@ -144,6 +144,15 @@ from a right one. The same applies to fractional truncation (`01S07`) on a
 numeric type; the temporal half of that diagnostic stays tolerant because
 PostgreSQL's own temporal types round to microseconds regardless.
 
+That `01S07` branch is a GUARD, not an active path, and the distinction is
+measured: no driver in the matrix returns `01S07` for any C type this extension
+binds. MySQL Connector/ODBC and Microsoft ODBC Driver 18 do return it, for
+`SQL_C_SLONG`, `SQL_C_NUMERIC` and `SQL_C_TYPE_TIME`, so the capability is real
+and its absence elsewhere is a choice; psqlODBC, SQLite ODBC and SAP HANA never
+return it at all, even where the specification says they should. For
+`SQL_C_CHAR` all five report `01004` instead. Do not delete the branch on the
+strength of that, and do not claim it is exercised.
+
 Temporal floors carry a FULL sub-second fraction rather than trusting the
 reported size. ODBC caps fractional seconds precision at 9, so the widest
 renderings are 18 characters for a time and 29 for a timestamp, and those are
@@ -201,6 +210,15 @@ That is the whole argument for the option existing. A driver returning
 corrupted text instead of an error cannot be distinguished from one returning
 the truth, so no amount of evidence from other drivers licenses a default.
 
+The driver's own `CHAR_AS_UTF8` connection property does the SAME DAMAGE, and it
+is worth knowing before recommending it: passed through as
+`odbc_CHAR_AS_UTF8 'TRUE'`, it produces byte-for-byte the same double encoding
+as the wide target -- `Grueszlige` as 11 bytes, md5 `d38ba5b3...`, against 7
+bytes and `49c5f675...` without it. The pass-through mechanism works; the
+setting is what corrupts. On this tenant, driver and image, a plain server with
+NO character options is the configuration that is byte-exact, and both remedies
+recorded against this driver elsewhere make it worse.
+
 The wide path accepts aligned 2-byte UTF-16 or 4-byte UTF-32 `SQLWCHAR` units,
 validates code points and surrogate pairs, converts them to UTF-8, and then
 converts from UTF-8 to the PostgreSQL server encoding. PostgreSQL text cannot
@@ -231,6 +249,27 @@ with transaction and subtransaction cleanup callbacks.
   alive.
 
 ## Metadata invariants
+
+### A derived type must not invent a scale
+
+`SQLColumns` reports `DECIMAL_DIGITS` as NULL for a type where it does not
+apply, which is how a driver describes a decimal whose scale belongs to each
+VALUE rather than to the column. Treating that NULL as 0 renders
+`numeric(column_size, 0)`, and PostgreSQL then ENFORCES that scale, so the
+import rounds every fractional part away at DDL time and no later scan can
+recover it.
+
+Keep the two distinguishable. `ODBC_SCALE_UNKNOWN` carries "the driver would not
+say" through to `sql_data_type`, which emits an unconstrained `numeric` when
+either the precision or the scale is unknown. An unconstrained `numeric` holds
+everything a `numeric(p,s)` holds and rounds nothing. A stated scale of 0 keeps
+its modifier, and that case must keep working, or the fix has merely become
+"drop every modifier".
+
+Measured, SAP HANA Client 2.29.25, `SQLColumns`: `SMALLDECIMAL` and
+unconstrained `DECIMAL` report `DECIMAL_DIGITS` NULL, `DECIMAL(18,4)` reports 4,
+`DECIMAL(38,0)` reports 0. Before the fix a remote `3.14159` imported as `3` and
+a remote `-0.00001` imported as `0`.
 
 Check every ODBC metadata call and validate NULL indicators, truncation, and
 integer widths before using returned values.

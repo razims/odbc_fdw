@@ -6,6 +6,164 @@ note that those version numbers are git tags of *other* repositories and do
 not line up with any `default_version` this extension ever declared. See
 `README.md` for provenance and for the versioning rule from `1.0.0` on.
 
+## 1.0.3
+Released 2026-08-14
+
+The git tag, `default_version`, base SQL script, and upgrade path all use the
+same version string. Existing 1.0.2 installations can upgrade in place with
+`ALTER EXTENSION odbc_fdw UPDATE TO '1.0.3'`; the intentionally empty upgrade
+script preserves dependent foreign tables and views because this release changes
+only the C library. No option is added, removed, or given a new default.
+
+Fixed — decimal values were silently truncated:
+
+A result column's buffer was sized from `SQLDescribeCol`'s column size, which
+for `SQL_DECIMAL` and `SQL_NUMERIC` is the PRECISION. A value's text rendering
+also needs a character for a sign and one for a decimal point, and neither was
+budgeted for, so a value was returned correctly only while its rendering was at
+most `max(precision, 32)` characters. Past that the driver truncated it, and
+whether anything noticed depended entirely on whether that driver would continue
+a truncated read — ODBC guarantees multi-call retrieval only for character and
+binary source types.
+
+- buffers are widened to the driver's `SQL_DESC_DISPLAY_SIZE`, as a lower bound
+  only: a driver that does not support the attribute, answers `SQL_NO_TOTAL`, or
+  reports something that cannot be a length leaves the previous sizing untouched;
+- a value shorter than the length the driver itself reported is refused instead
+  of returned, naming the column and both lengths;
+- fractional truncation (`SQLSTATE 01S07`) on a numeric column is refused. ODBC
+  defines that diagnostic over two groups; dropping digits from a NUMBER changes
+  it unrecoverably, while sub-second precision on a temporal value is rounded by
+  PostgreSQL's own types in any case and keeps the tolerant behaviour;
+- a driver reporting less data remaining than it has already delivered is
+  refused rather than used to size the next read.
+
+Measured on two unrelated drivers. Microsoft ODBC Driver 18.6.2.1 against SQL
+Server 2025 reproduces it with no credentials at all: `DECIMAL(38,2)` holding
+`-999999999999999999999999999999999999.99` reported 40 bytes, delivered 38, and
+declined to continue, so `numeric(38,2)` padded the missing digits back with
+zeros and the column read `-999999999999999999999999999999999999.00` — an
+ordinary currency amount with its cents replaced, the right row count, and no
+diagnostic anywhere. SAP HANA fails identically. Both are byte-exact after the
+change.
+
+Ruled out: this is not specific to one database product. psqlODBC and MySQL
+Connector/ODBC undersize the same buffer and report the same `01004` truncation
+for the same values, and lose nothing only because they honour the continuation
+call. `DECIMAL` precision at or below 30 was never affected.
+
+Fixed — timestamps were truncated on the only read their driver would answer:
+
+The buffer floors for time and timestamp budgeted no sub-second fraction, at 8
+and 20 characters, and relied on the driver's reported size. SAP HANA reports a
+column size and a display size of 27 for `TIMESTAMP` and then renders 29 bytes.
+The floors are now the widest renderings ODBC permits — fractional seconds
+precision is capped at 9, giving 18 for a time and 29 for a timestamp — so the
+value arrives in one call. The lost characters had been trailing zeros of a
+fraction PostgreSQL rounds away, so the effect was invisible; the mechanism was
+the same one that loses decimal digits.
+
+Fixed — floating point values were limited by the driver's text rendering:
+
+`SQL_REAL`, `SQL_FLOAT` and `SQL_DOUBLE` were retrieved as text and reparsed. A
+driver's rendering is not required to round-trip the value, and SAP HANA's uses
+15 significant digits: `0.12345678901234566` came back `0.1234567890123456`, a
+different double, and `DBL_MAX` came back `1.79769313486232E+308` — a number
+larger than `DBL_MAX`, which PostgreSQL refuses with `is out of range for type
+double precision`, failing the whole scan.
+
+These columns are now retrieved as `SQL_C_FLOAT` and `SQL_C_DOUBLE` and rendered
+by PostgreSQL's own `float4out` and `float8out`, so the text is exactly what
+PostgreSQL prints for the value and the driver's rendering leaves the path.
+`float4` is kept separate from `float8`: widening a real to a double would print
+`0.10000000149011612` where PostgreSQL prints `0.1`.
+
+Fixed — an imported decimal was constrained to a scale the driver never stated:
+
+`SQLColumns` reports `DECIMAL_DIGITS` as NULL for a type where it does not
+apply, which is how a driver describes a decimal whose scale belongs to each
+value rather than to the column. That NULL was read as a scale of 0, so the
+import derived `numeric(column_size, 0)` — and PostgreSQL then ENFORCES that
+scale, rounding the fractional part away at DDL time where no later scan can
+recover it.
+
+Measured against SAP HANA, importing the same fixture before and after:
+
+| remote column | before | after |
+| --- | --- | --- |
+| `SMALLDECIMAL` holding `3.14159` | `numeric(16,0)` → `3` | `numeric` → `3.14159` |
+| `DECIMAL` holding `2.718281828459045` | `numeric(34,0)` → `3` | `numeric` → exact |
+| `SMALLDECIMAL` holding `-0.00001` | `numeric(16,0)` → `0` | `numeric` → `-0.00001` |
+| `DECIMAL(18,4)` | `numeric(18,4)` | `numeric(18,4)` |
+| `DECIMAL(38,0)` | `numeric(38,0)` | `numeric(38,0)` |
+
+An unconstrained `numeric` holds everything a `numeric(p,s)` holds and rounds
+nothing, so it is the safe rendering when either precision or scale is unknown.
+The last two rows are the point: a stated scale — including a genuine scale of
+zero — keeps its modifier, so this distinguishes the two cases rather than
+dropping every modifier. It also fixes a latent case where an absent column size
+produced `numeric(0,0)`, which PostgreSQL rejects outright.
+
+This is not a regression introduced by a recent release: the derivation is
+character-for-character identical as far back as 1.0.0.
+
+Unchanged — `wide_char_mode` still defaults to `char`, and the reason is now
+measured rather than assumed:
+
+Defaulting to `SQL_C_WCHAR` for the ODBC wide types was implemented, tested, and
+reverted. It is byte-identical on MySQL Connector/ODBC and Microsoft ODBC Driver
+18, and psqlODBC and SQLite ODBC report no wide types at all, so four drivers
+gave no reason against it. Asked for a wide target the SAP HANA client then
+returns its UTF-8 bytes zero-extended into `SQLWCHAR` units rather than UTF-16,
+so every byte becomes a code point and the value arrives DOUBLE ENCODED —
+`Grüße` as 11 bytes instead of 7 — with no diagnostic, while the same rows
+through `SQL_C_CHAR` are byte-exact.
+
+That is the hazard this option exists for, and it is why the mode cannot be
+probed or defaulted from evidence about other drivers: a driver returning
+plausible wrong text is indistinguishable from one returning the truth. Set
+`wide_char_mode 'wchar'` where a driver requires it, as the Oracle, MySQL, and
+SQL Server suites do.
+
+The same driver's `CHAR_AS_UTF8` connection property, passed through as
+`odbc_CHAR_AS_UTF8 'TRUE'`, produces byte-for-byte the same double encoding as
+the wide target. The pass-through works; the setting is what corrupts. A plain
+server carrying no character options is the byte-exact configuration here.
+
+Added — regression coverage:
+- a money matrix on the credential-free SQL Server suite: one column per
+  declared precision and scale across the 30/31/32 boundary up to 38, each at
+  the extremes of its own domain in both signs, plus the smallest representable
+  unit, zero, an all-NULL row and a SUM, asserted through `text` and through
+  `numeric(p,s)`;
+- a writing-system matrix of 40 scripts spanning the Unicode planes — Latin,
+  Greek, Cyrillic, Armenian, Hebrew, Arabic, Syriac, Thaana, N'Ko, Devanagari,
+  Bengali, Gurmukhi, Tamil, Telugu, Sinhala, Thai, Lao, Tibetan, Myanmar,
+  Georgian, Ethiopic, Cherokee, Khmer, Mongolian, Hiragana, Katakana, Han,
+  Hangul, Tifinagh, Vai — plus combining marks, right-to-left text, zero-width
+  joiner sequences and four supplementary-plane rows, asserted by code point,
+  character length and octet length;
+- SQL Server and SAP HANA fixtures for decimals whose rendering exceeds their
+  precision, at both signs, split by scale on SQL Server because that driver
+  fails loudly for scale 0 and silently for scale 2;
+- a SAP HANA fixture for decimals whose scale the driver does not state, beside
+  ones where it does, so the import fix cannot pass by dropping all modifiers;
+- the money matrix and the 40-script writing-system matrix mirrored onto the SAP
+  HANA suite, so the same boundaries are proved against the driver where the
+  silent defects were found and not only against the credential-free one;
+- the Oracle session-leak gate now reports a missing `SELECT` on `SYS.V_$SESSION`
+  as an explicit SKIP naming the grant, instead of failing the whole suite with a
+  message that reads like a leak regression. Only an Oracle visibility error may
+  skip; any other failure to read a session count still fails, and requesting
+  `ORACLE_BULK_ROWS` without the grant is refused rather than silently reduced.
+- SAP HANA fixtures for a full-precision double, `DBL_MAX`, its negative, and
+  the smallest normal double, asserted through both a `double precision` and a
+  `text` foreign-table declaration;
+- a multi-script fixture covering Cyrillic, Han, Ethiopic, Yoruba with a
+  combining mark, N'Ko, Tifinagh, and two supplementary-plane characters, every
+  literal assembled from code units on the server so the fixture cannot itself
+  be re-encoded in transit.
+
 ## 1.0.2
 Released 2026-08-14
 

@@ -207,6 +207,69 @@ CREATE FOREIGN TABLE probe.wide_decimal_text (
     schema :'hana_schema', table 'ODBC_FDW_WIDE_DECIMAL',
     id 'ID', d38_2 'D38_2', d38_0 'D38_0', d18_4 'D18_4'
 );
+CREATE FOREIGN TABLE probe.money_text (
+    id integer, label text,
+    d1_0 text,
+    d9_2 text,
+    d15_2 text,
+    d18_4 text,
+    d19_4 text,
+    d28_6 text,
+    d30_0 text,
+    d31_0 text,
+    d32_0 text,
+    d34_2 text,
+    d38_0 text,
+    d38_2 text
+) SERVER hana OPTIONS (
+    schema :'hana_schema', table 'ODBC_FDW_MONEY_MATRIX', id 'ID', label 'LABEL',
+    d1_0 'D1_0',
+    d9_2 'D9_2',
+    d15_2 'D15_2',
+    d18_4 'D18_4',
+    d19_4 'D19_4',
+    d28_6 'D28_6',
+    d30_0 'D30_0',
+    d31_0 'D31_0',
+    d32_0 'D32_0',
+    d34_2 'D34_2',
+    d38_0 'D38_0',
+    d38_2 'D38_2'
+);
+CREATE FOREIGN TABLE probe.money_numeric (
+    id integer, label text,
+    d1_0 numeric(1,0),
+    d9_2 numeric(9,2),
+    d15_2 numeric(15,2),
+    d18_4 numeric(18,4),
+    d19_4 numeric(19,4),
+    d28_6 numeric(28,6),
+    d30_0 numeric(30,0),
+    d31_0 numeric(31,0),
+    d32_0 numeric(32,0),
+    d34_2 numeric(34,2),
+    d38_0 numeric(38,0),
+    d38_2 numeric(38,2)
+) SERVER hana OPTIONS (
+    schema :'hana_schema', table 'ODBC_FDW_MONEY_MATRIX', id 'ID', label 'LABEL',
+    d1_0 'D1_0',
+    d9_2 'D9_2',
+    d15_2 'D15_2',
+    d18_4 'D18_4',
+    d19_4 'D19_4',
+    d28_6 'D28_6',
+    d30_0 'D30_0',
+    d31_0 'D31_0',
+    d32_0 'D32_0',
+    d34_2 'D34_2',
+    d38_0 'D38_0',
+    d38_2 'D38_2'
+);
+CREATE FOREIGN TABLE probe.charset_matrix (id integer, script_name text, value text)
+SERVER hana OPTIONS (
+    schema :'hana_schema', table 'ODBC_FDW_CHARSET_MATRIX', id 'ID',
+    script_name 'SCRIPT_NAME', value 'VALUE'
+);
 CREATE SCHEMA imported_scale;
 IMPORT FOREIGN SCHEMA :"hana_schema" LIMIT TO ("ODBC_FDW_SCALE_MATRIX")
     FROM SERVER hana INTO imported_scale;
@@ -230,6 +293,158 @@ SELECT 'direct_time=' || CASE WHEN
 SELECT 'direct_timestamp=' || CASE WHEN
     (SELECT timestamp_value FROM probe.direct_types WHERE id = 1) = TIMESTAMP '2024-01-02 03:04:05' AND
     (SELECT timestamp_value FROM probe.direct_types WHERE id = 2) = TIMESTAMP '2024-12-31 23:59:59'
+    THEN 'ok' ELSE 'bad' END;
+
+-- Drivers disagree on one cosmetic point: some render a value below 1 without
+-- its leading zero. Normalised on BOTH sides rather than baking one driver's
+-- spelling in; it cannot hide truncation, which removes characters from the
+-- RIGHT and never the optional zero before the point.
+CREATE FUNCTION norm_decimal(t text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$ SELECT regexp_replace(t, '^(-?)0\.', '\1.') $$;
+
+SELECT 'money_text=' || CASE WHEN (
+    SELECT count(*) FROM (
+        SELECT m.id, c.col, c.got FROM probe.money_text m
+        CROSS JOIN LATERAL (VALUES
+                    ('d1_0', m.d1_0),
+                    ('d9_2', m.d9_2),
+                    ('d15_2', m.d15_2),
+                    ('d18_4', m.d18_4),
+                    ('d19_4', m.d19_4),
+                    ('d28_6', m.d28_6),
+                    ('d30_0', m.d30_0),
+                    ('d31_0', m.d31_0),
+                    ('d32_0', m.d32_0),
+                    ('d34_2', m.d34_2),
+                    ('d38_0', m.d38_0),
+                    ('d38_2', m.d38_2)
+        ) AS c(col, got)
+    ) g
+    JOIN (VALUES
+            (1,'d1_0','9'),
+            (1,'d9_2','9999999.99'),
+            (1,'d15_2','9999999999999.99'),
+            (1,'d18_4','99999999999999.9999'),
+            (1,'d19_4','999999999999999.9999'),
+            (1,'d28_6','9999999999999999999999.999999'),
+            (1,'d30_0','999999999999999999999999999999'),
+            (1,'d31_0','9999999999999999999999999999999'),
+            (1,'d32_0','99999999999999999999999999999999'),
+            (1,'d34_2','99999999999999999999999999999999.99'),
+            (1,'d38_0','99999999999999999999999999999999999999'),
+            (1,'d38_2','999999999999999999999999999999999999.99'),
+            (2,'d1_0','-9'),
+            (2,'d9_2','-9999999.99'),
+            (2,'d15_2','-9999999999999.99'),
+            (2,'d18_4','-99999999999999.9999'),
+            (2,'d19_4','-999999999999999.9999'),
+            (2,'d28_6','-9999999999999999999999.999999'),
+            (2,'d30_0','-999999999999999999999999999999'),
+            (2,'d31_0','-9999999999999999999999999999999'),
+            (2,'d32_0','-99999999999999999999999999999999'),
+            (2,'d34_2','-99999999999999999999999999999999.99'),
+            (2,'d38_0','-99999999999999999999999999999999999999'),
+            (2,'d38_2','-999999999999999999999999999999999999.99'),
+            (3,'d1_0','1'),
+            (3,'d9_2','0.01'),
+            (3,'d15_2','0.01'),
+            (3,'d18_4','0.0001'),
+            (3,'d19_4','0.0001'),
+            (3,'d28_6','0.000001'),
+            (3,'d30_0','1'),
+            (3,'d31_0','1'),
+            (3,'d32_0','1'),
+            (3,'d34_2','0.01'),
+            (3,'d38_0','1'),
+            (3,'d38_2','0.01'),
+            (4,'d1_0','0'),
+            (4,'d9_2','0.00'),
+            (4,'d15_2','0.00'),
+            (4,'d18_4','0.0000'),
+            (4,'d19_4','0.0000'),
+            (4,'d28_6','0.000000'),
+            (4,'d30_0','0'),
+            (4,'d31_0','0'),
+            (4,'d32_0','0'),
+            (4,'d34_2','0.00'),
+            (4,'d38_0','0'),
+            (4,'d38_2','0.00'),
+            (5,'d1_0','1'),
+            (5,'d9_2','1234.56'),
+            (5,'d15_2','1234.56'),
+            (5,'d18_4','1234.5678'),
+            (5,'d19_4','1234.5678'),
+            (5,'d28_6','1234.567890'),
+            (5,'d30_0','1234'),
+            (5,'d31_0','1234'),
+            (5,'d32_0','1234'),
+            (5,'d34_2','1234.56'),
+            (5,'d38_0','1234'),
+            (5,'d38_2','1234.56')
+        ) AS e(id, col, want) ON e.id = g.id AND e.col = g.col
+    WHERE norm_decimal(g.got) IS DISTINCT FROM norm_decimal(e.want)) = 0
+    AND (SELECT count(*) FROM probe.money_text) = 6
+    THEN 'ok' ELSE 'bad' END;
+
+SELECT 'money_numeric=' || CASE WHEN
+    (SELECT d38_2 FROM probe.money_numeric WHERE label = 'max_negative') = numeric '-999999999999999999999999999999999999.99' AND
+    (SELECT d32_0 FROM probe.money_numeric WHERE label = 'max_negative') = numeric '-99999999999999999999999999999999' AND
+    (SELECT d38_2 FROM probe.money_numeric WHERE label = 'smallest_unit') = numeric '0.01' AND
+    (SELECT sum(d38_2) FROM probe.money_numeric) = numeric '1234.57' AND
+    (SELECT d38_2 IS NULL AND d1_0 IS NULL AND d30_0 IS NULL
+     FROM probe.money_numeric WHERE label = 'nulls')
+    THEN 'ok' ELSE 'bad' END;
+
+SELECT 'charset_matrix=' || CASE WHEN (
+    SELECT count(*) FROM probe.charset_matrix c
+    JOIN (VALUES
+            (1,chr(65)||chr(66)||chr(67)||chr(49)||chr(50)||chr(33)),
+            (2,chr(99)||chr(97)||chr(102)||chr(233)||chr(32)||chr(220)||chr(223)||chr(241)),
+            (3,chr(268)||chr(345)||chr(337)||chr(382)||chr(322)||chr(7865)),
+            (4,chr(917)||chr(955)||chr(955)||chr(940)||chr(948)||chr(945)),
+            (5,chr(1055)||chr(1088)||chr(1080)||chr(1074)||chr(1077)||chr(1090)),
+            (6,chr(1329)||chr(1377)||chr(1397)||chr(1381)||chr(1408)),
+            (7,chr(1513)||chr(1500)||chr(1493)||chr(1501)),
+            (8,chr(1605)||chr(1585)||chr(1581)||chr(1576)||chr(1575)),
+            (9,chr(1828)||chr(1824)||chr(1835)||chr(1808)),
+            (10,chr(1931)||chr(1960)||chr(1928)||chr(1964)||chr(1920)||chr(1960)),
+            (11,chr(2002)||chr(2014)||chr(1999)),
+            (12,chr(2344)||chr(2350)||chr(2360)||chr(2381)||chr(2340)||chr(2375)),
+            (13,chr(2489)||chr(2509)||chr(2479)||chr(2494)||chr(2482)||chr(2507)),
+            (14,chr(2616)||chr(2596)||chr(2623)||chr(2616)||chr(2637)||chr(2608)||chr(2624)),
+            (15,chr(2997)||chr(2979)||chr(3007)||chr(2965)||chr(3021)||chr(2965)||chr(2990)||chr(3021)),
+            (16,chr(3112)||chr(3118)||chr(3128)||chr(3149)||chr(3093)||chr(3134)||chr(3120)||chr(3074)),
+            (17,chr(3521)||chr(3530)||chr(3515)||chr(3539)),
+            (18,chr(3626)||chr(3623)||chr(3633)||chr(3626)||chr(3604)||chr(3637)),
+            (19,chr(3754)||chr(3760)||chr(3738)||chr(3762)||chr(3725)||chr(3732)||chr(3765)),
+            (20,chr(3926)||chr(3851)||chr(3921)||chr(3962)),
+            (21,chr(4121)||chr(4100)||chr(4154)||chr(4153)||chr(4098)||chr(4124)||chr(4140)),
+            (22,chr(4306)||chr(4304)||chr(4315)||chr(4304)||chr(4320)||chr(4335)),
+            (23,chr(4656)||chr(4619)||chr(4637)),
+            (24,chr(5091)||chr(5043)||chr(5033)),
+            (25,chr(6023)||chr(6040)||chr(6042)||chr(6070)||chr(6038)||chr(6047)||chr(6076)||chr(6042)),
+            (26,chr(6176)||chr(6199)||chr(6178)||chr(6184)),
+            (27,chr(12371)||chr(12435)||chr(12395)||chr(12385)||chr(12399)),
+            (28,chr(12459)||chr(12479)||chr(12459)||chr(12490)),
+            (29,chr(21271)||chr(20140)||chr(26481)||chr(20140)),
+            (30,chr(50504)||chr(45397)||chr(54616)||chr(49464)||chr(50836)),
+            (31,chr(11612)||chr(11568)||chr(11618)),
+            (32,chr(42240)||chr(42251)||chr(42273)),
+            (33,chr(101)||chr(769)||chr(7885)||chr(768)),
+            (34,chr(1575)||chr(1604)||chr(1593)||chr(32)||chr(65)||chr(66)||chr(67)),
+            (35,chr(128512)||chr(128640)),
+            (36,chr(119070)||chr(119074)),
+            (37,chr(134071)||chr(173746)),
+            (38,chr(125184)||chr(125217)),
+            (39,chr(128105)||chr(8205)||chr(128187)),
+            (40,chr(128077)||chr(127997))
+        ) AS e(id, want) ON e.id = c.id
+    WHERE c.value IS DISTINCT FROM e.want) = 0
+    AND (SELECT count(*) FROM probe.charset_matrix) = 40
+    AND (SELECT length(value) FROM probe.charset_matrix WHERE script_name = 'supp_emoji') = 2
+    AND (SELECT octet_length(value) FROM probe.charset_matrix WHERE script_name = 'supp_emoji') = 8
+    AND (SELECT length(value) FROM probe.charset_matrix WHERE script_name = 'emoji_zwj') = 3
+    AND (SELECT length(value) FROM probe.charset_matrix WHERE script_name = 'combining') = 4
     THEN 'ok' ELSE 'bad' END;
 
 -- An imported column whose remote scale is unstated must not be constrained to

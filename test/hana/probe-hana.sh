@@ -89,6 +89,7 @@ assertions=(
     ascii_text cyrillic_text utf8_text json_direct json_import json_nulls
     direct_case_names import_case_names sql_query parameter_in_out large_value
     wide_decimal float_roundtrip float_text import_scale
+    money_text money_numeric charset_matrix
     rescan
 )
 
