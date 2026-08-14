@@ -604,12 +604,30 @@ minimum_buffer_size(SQLSMALLINT odbc_data_type)
 	case SQL_TYPE_DATE :
 	case SQL_DATE :
 		return 10;
+	/*
+	 * Temporal floors carry a FULL sub-second fraction, because a driver may
+	 * render more digits than it reports room for.
+	 *
+	 * ODBC caps fractional seconds precision at 9, making the widest renderings
+	 * hh:mm:ss.fffffffff (8 + 1 + 9 = 18) and
+	 * yyyy-mm-dd hh:mm:ss.fffffffff (19 + 1 + 9 = 29). The previous floors of 8
+	 * and 20 budgeted no fraction at all and relied on the column size, which
+	 * is not always enough either: SAP HANA reports both a column size and a
+	 * display size of 27 for TIMESTAMP and then renders 29 bytes, so the value
+	 * was truncated on the only SQLGetData call the driver would answer.
+	 *
+	 * That truncation was harmless in its effect and not in its mechanism --
+	 * the lost characters were trailing zeros of a fraction PostgreSQL rounds
+	 * to microseconds anyway. Sizing for the full fraction removes the
+	 * truncation rather than tolerating it, which keeps the shortfall check
+	 * that follows the read strict for every type.
+	 */
 	case SQL_TYPE_TIME :
 	case SQL_TIME :
-		return 8;
+		return 18;
 	case SQL_TYPE_TIMESTAMP :
 	case SQL_TIMESTAMP :
-		return 20;
+		return 29;
 	default :
 		return 0;
 	};
