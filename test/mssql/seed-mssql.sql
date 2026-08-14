@@ -1,3 +1,5 @@
+DROP TABLE IF EXISTS dbo.ODBC_FDW_WIDE_DECIMAL;
+DROP TABLE IF EXISTS dbo.ODBC_FDW_WIDE_DECIMAL_S0;
 DROP TABLE IF EXISTS dbo.ODBC_FDW_DATA_TYPES;
 DROP TABLE IF EXISTS dbo.ODBC_FDW_TYPE_MATRIX;
 DROP TABLE IF EXISTS dbo.ODBC_FDW_LARGE_VALUES;
@@ -75,6 +77,37 @@ INSERT INTO dbo.ODBC_FDW_LARGE_VALUES VALUES
 
 CREATE TABLE dbo.ODBC_FDW_SINGLE_ROW (ID int PRIMARY KEY, PAYLOAD varchar(100));
 INSERT INTO dbo.ODBC_FDW_SINGLE_ROW VALUES (1, 'rescan');
+
+-- Decimals whose TEXT rendering is longer than their precision, which is the
+-- quantity a column buffer used to be sized from. Both signs are seeded: the
+-- sign is one of the two characters that rendering needs and the precision does
+-- not budget for, so a negative value is a full character wider than its
+-- positive counterpart and fails at a precision the positive one survives.
+--
+-- Split by SCALE, because the two fail differently here and only one of them is
+-- silent. Microsoft ODBC Driver 18 raises "Numeric value out of range" when a
+-- scale-0 decimal does not fit, which at least stops the scan. For
+-- decimal(38,2) it reports the full length, delivers a short value and declines
+-- to continue -- and PostgreSQL's numeric(38,2) then PADS the missing digits
+-- back with zeros, so the result is a plausible wrong amount and nothing stops
+-- at all. That is the case these fixtures exist for.
+CREATE TABLE dbo.ODBC_FDW_WIDE_DECIMAL (
+    ID int PRIMARY KEY,
+    D38_2 decimal(38,2),
+    D18_4 decimal(18,4)
+);
+INSERT INTO dbo.ODBC_FDW_WIDE_DECIMAL VALUES
+    (1,  999999999999999999999999999999999999.99,  12345678901234.5678),
+    (2, -999999999999999999999999999999999999.99, -12345678901234.5678);
+
+CREATE TABLE dbo.ODBC_FDW_WIDE_DECIMAL_S0 (
+    ID int PRIMARY KEY,
+    D38_0 decimal(38,0),
+    D32_0 decimal(32,0)
+);
+INSERT INTO dbo.ODBC_FDW_WIDE_DECIMAL_S0 VALUES
+    (1,  99999999999999999999999999999999999999,  99999999999999999999999999999999),
+    (2, -99999999999999999999999999999999999999, -99999999999999999999999999999999);
 
 CREATE TABLE dbo.ODBC_FDW_CASE_NAMES (
     UPPER_VALUE int,

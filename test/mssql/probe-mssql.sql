@@ -76,6 +76,29 @@ CREATE FOREIGN TABLE probe.type_matrix (
     smalldatetime_value 'SMALLDATETIME_VALUE', guid_value 'GUID_VALUE',
     binary_value 'BINARY_VALUE', varbinary_value 'VARBINARY_VALUE', image_value 'IMAGE_VALUE'
 );
+-- Declared twice on purpose. The numeric declaration is what an operator would
+-- write, and numeric(p,s) pads a short rendering back to scale with zeros, so
+-- it can only catch a loss that changes the padded result. The text declaration
+-- carries the bytes the wrapper actually produced, so a single lost character
+-- is visible whatever its position.
+CREATE FOREIGN TABLE probe.wide_decimal (
+    id integer, d38_2 numeric(38,2), d18_4 numeric(18,4)
+) SERVER mssql OPTIONS (
+    schema 'dbo', table 'ODBC_FDW_WIDE_DECIMAL', id 'ID',
+    d38_2 'D38_2', d18_4 'D18_4'
+);
+CREATE FOREIGN TABLE probe.wide_decimal_text (
+    id integer, d38_2 text, d18_4 text
+) SERVER mssql OPTIONS (
+    schema 'dbo', table 'ODBC_FDW_WIDE_DECIMAL', id 'ID',
+    d38_2 'D38_2', d18_4 'D18_4'
+);
+CREATE FOREIGN TABLE probe.wide_decimal_s0 (
+    id integer, d38_0 numeric(38,0), d32_0 numeric(32,0)
+) SERVER mssql OPTIONS (
+    schema 'dbo', table 'ODBC_FDW_WIDE_DECIMAL_S0', id 'ID',
+    d38_0 'D38_0', d32_0 'D32_0'
+);
 CREATE FOREIGN TABLE probe.large_values (id integer, text_value text, blob_value bytea)
 SERVER mssql OPTIONS (
     schema 'dbo', table 'ODBC_FDW_LARGE_VALUES', id 'ID',
@@ -186,6 +209,30 @@ SELECT 'parameter_in_out=' || CASE WHEN
      CROSS JOIN LATERAL
          (SELECT text_value FROM probe.direct_types WHERE id = input.id) remote
      WHERE remote.text_value = input.expected) = 'alpha,beta'
+    THEN 'ok' ELSE 'bad' END;
+-- The SILENT case, asserted first and on its own.
+--
+-- Against 1.0.2 this returns 'bad' rather than an error: the driver reports 40
+-- bytes for the negative decimal(38,2), delivers 38, and does not continue, so
+-- the text column reads '-999999999999999999999999999999999999' and the numeric
+-- column reads '-999999999999999999999999999999999999.00' -- the cents replaced
+-- by zeros, with the right row count and no diagnostic anywhere. d18_4 is the
+-- paired success case: it fits the old sizing and was always correct, so a
+-- failure here is the fix breaking something rather than the defect surviving.
+SELECT 'wide_decimal=' || CASE WHEN
+    (SELECT d38_2 FROM probe.wide_decimal_text WHERE id = 1) = '999999999999999999999999999999999999.99' AND
+    (SELECT d38_2 FROM probe.wide_decimal_text WHERE id = 2) = '-999999999999999999999999999999999999.99' AND
+    (SELECT d18_4 FROM probe.wide_decimal_text WHERE id = 2) = '-12345678901234.5678' AND
+    (SELECT d38_2 FROM probe.wide_decimal WHERE id = 2) = -999999999999999999999999999999999999.99 AND
+    (SELECT d18_4 FROM probe.wide_decimal WHERE id = 1) = 12345678901234.5678
+    THEN 'ok' ELSE 'bad' END;
+-- The LOUD case. Against 1.0.2 this aborts the scan with "Numeric value out of
+-- range" instead of returning a value, so it is kept separate: an abort here
+-- would otherwise stop the silent assertion above from ever being reported.
+SELECT 'wide_decimal_scale0=' || CASE WHEN
+    (SELECT d38_0 FROM probe.wide_decimal_s0 WHERE id = 2) = -99999999999999999999999999999999999999 AND
+    (SELECT d32_0 FROM probe.wide_decimal_s0 WHERE id = 2) = -99999999999999999999999999999999 AND
+    (SELECT d38_0 FROM probe.wide_decimal_s0 WHERE id = 1) = 99999999999999999999999999999999999999
     THEN 'ok' ELSE 'bad' END;
 SELECT 'large_value=' || CASE WHEN
     (SELECT length(text_value) FROM probe.large_values) = 6000 AND

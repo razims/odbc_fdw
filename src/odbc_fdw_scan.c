@@ -153,6 +153,37 @@ resize_buffer(char ** buffer, int *size, int used_size, int required_size)
 	}
 }
 
+/*
+ * The number of characters the driver says it needs to display a column.
+ *
+ * This is the question a text retrieval actually asks, and it is NOT the one
+ * SQLDescribeCol's column size answers. For SQL_DECIMAL and SQL_NUMERIC the
+ * column size is the PRECISION, which budgets digits and nothing else, so a
+ * buffer sized from it has no room for a leading sign or a decimal point --
+ * measured: psqlODBC, MySQL Connector/ODBC and Microsoft ODBC Driver 18 all
+ * report column size 38 and display size 40 for DECIMAL(38,2), whose negative
+ * values render to exactly 40 characters.
+ *
+ * Used as a LOWER BOUND only. A driver that does not support the attribute,
+ * answers SQL_NO_TOTAL, or reports something that cannot be a length leaves
+ * the existing sizing untouched; nothing here can make a buffer smaller than
+ * it would otherwise have been.
+ */
+static SQLULEN
+odbc_display_size(SQLHSTMT stmt, SQLUSMALLINT column)
+{
+	SQLLEN display_size = 0;
+	SQLRETURN ret;
+
+	ret = SQLColAttribute(stmt, column, SQL_DESC_DISPLAY_SIZE, NULL, 0, NULL,
+	                      &display_size);
+	if (!SQL_SUCCEEDED(ret))
+		return 0;
+	if (display_size <= 0 || display_size > (SQLLEN) PG_INT32_MAX)
+		return 0;
+	return (SQLULEN) display_size;
+}
+
 /* Prefer exact identifier matches; use case folding only when unambiguous. */
 static int
 find_table_column(StringInfoData *table_columns, int num_columns,
@@ -846,8 +877,20 @@ odbcIterateForeignScan(ForeignScanState *node)
 			{
 				SQLULEN min_size = minimum_buffer_size(DataTypePtr);
 				SQLULEN max_size = MAXIMUM_BUFFER_SIZE;
+				SQLULEN display_size = odbc_display_size(stmt,
+				                                         (SQLUSMALLINT) i);
 
 				col_position_mask = lappend_int(col_position_mask, mapped_pos);
+				/*
+				 * Widen to the driver's display size before the type floor, so
+				 * a value whose text rendering exceeds its column size arrives
+				 * in ONE SQLGetData call. That matters beyond efficiency: ODBC
+				 * guarantees a value can be retrieved across several calls only
+				 * for character and binary source types, so for every other
+				 * type the first call is the only call a driver need honour.
+				 */
+				if (ColumnSizePtr < display_size)
+					ColumnSizePtr = display_size;
 				if (ColumnSizePtr < min_size)
 					ColumnSizePtr = min_size;
 				if (ColumnSizePtr > max_size)
@@ -949,6 +992,13 @@ odbcIterateForeignScan(ForeignScanState *node)
 			GetDataTruncation truncation;
 			bool binary_data = false;
 			bool wide_data = false;
+			/*
+			 * How many bytes the driver said this value measures, or -1 while
+			 * it has not said. Set from the length reported alongside a
+			 * truncation, and checked once the read has finished; see the test
+			 * after the loop.
+			 */
+			int64 expected_field_bytes = -1;
 			if (conversion == BIN_CONVERSION)
 			{
 				target_type	= SQL_C_BINARY;
@@ -1113,6 +1163,15 @@ odbcIterateForeignScan(ForeignScanState *node)
 					}
 					else
 					{
+						/*
+						 * Record what the driver has just promised. The
+						 * indicator is the length still available at the START
+						 * of this call, so the whole value measures what had
+						 * already been assembled plus that -- computed here,
+						 * before this chunk is counted.
+						 */
+						expected_field_bytes = (int64) used_buffer_size +
+						                       (int64) result_size;
 						// we read chunk_size, but there was result_size pending in total;
 						// adjust chunk_size for the remaining, so next wil hopely be the final chunk
 						used_buffer_size += effective_chunk_size;
@@ -1136,6 +1195,19 @@ odbcIterateForeignScan(ForeignScanState *node)
 							                   (int64) result_size)));
 						// note that we need to read result_size - effective_chunk_size more data bytes,
 						chunk_size = (int)result_size - effective_chunk_size;
+						/*
+						 * A driver reporting less remaining than it has just
+						 * delivered has contradicted itself, and the next
+						 * SQLGetData would be sized from that. Refuse rather
+						 * than continue with arithmetic known to be wrong.
+						 */
+						if (chunk_size < 0)
+							ereport(ERROR,
+							        (errcode(ERRCODE_FDW_ERROR),
+							         errmsg("odbc_fdw: ODBC driver reported an impossible remaining length"),
+							         errdetail("Result column %d: reported " INT64_FORMAT " bytes remaining after delivering %d.",
+							                   (int) i, (int64) result_size,
+							                   effective_chunk_size)));
 						// wait, maybe we don't need to read, just append a zero!
 						if (chunk_size == 0)
 						{
@@ -1196,6 +1268,48 @@ odbcIterateForeignScan(ForeignScanState *node)
 						                    ? chunk_size : (int) result_size;
 				}
 			} while (truncation == STRING_TRUNCATION && chunk_size > 0);
+
+			/*
+			 * A value shorter than the driver said it was IS DATA LOSS, and
+			 * this is the test that refuses to return it.
+			 *
+			 * The loop above can end with less than the whole value in three
+			 * ways, and none of them reports anything by itself: SQLGetData
+			 * answers SQL_NO_DATA to the continuation, or answers success with
+			 * nothing left to give, or the truncation arm's own bookkeeping
+			 * stops early. ODBC guarantees multi-call retrieval only for
+			 * character and binary source types, so a driver rendering some
+			 * other type to text may legitimately refuse to continue -- and
+			 * the code then kept whatever the first call had copied.
+			 *
+			 * For DECIMAL that is silent and catastrophic. numeric(p,s) PADS a
+			 * short rendering back to scale with ZEROS, so a currency amount
+			 * whose fractional digits were dropped arrives as a plausible
+			 * number, with the right row count, the right column count and no
+			 * diagnostic anywhere. Measured on Microsoft ODBC Driver 18:
+			 * DECIMAL(38,2) holding -999999999999999999999999999999999999.99
+			 * reported 40 bytes, delivered 38, and the column read
+			 * -999999999999999999999999999999999999.00.
+			 *
+			 * The sizing above is what PREVENTS the truncation; this is what
+			 * happens when a driver reports a display size that turns out not
+			 * to be enough. It is deliberately a refusal and not a repair,
+			 * because the lost digits cannot be recovered from here.
+			 *
+			 * Compared before the terminator scan below, on the raw assembled
+			 * byte count, which is the quantity the driver's own length is
+			 * comparable with. A driver that reports SQL_NO_TOTAL promises
+			 * nothing and is not checked -- there is nothing to check against.
+			 */
+			if (expected_field_bytes >= 0 &&
+			    (int64) used_buffer_size < expected_field_bytes)
+				ereport(ERROR,
+				        (errcode(ERRCODE_FDW_ERROR),
+				         errmsg("odbc_fdw: ODBC driver returned a truncated value for result column %d",
+				                (int) i),
+				         errdetail("The driver reported " INT64_FORMAT " bytes and delivered %d.",
+				                   expected_field_bytes, used_buffer_size),
+				         errhint("The driver did not continue a truncated read for this column's type. The truncated value is refused rather than returned.")));
 
 			if (!binary_data && !wide_data)
 			{
