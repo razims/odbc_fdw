@@ -1,3 +1,4 @@
+DROP TABLE "@SCHEMA@"."ODBC_FDW_NCLOB_SIZES";
 DROP TABLE "@SCHEMA@"."ODBC_FDW_MONEY_MATRIX";
 DROP TABLE "@SCHEMA@"."ODBC_FDW_CHARSET_MATRIX";
 DROP TABLE "@SCHEMA@"."ODBC_FDW_SCALE_MATRIX";
@@ -270,3 +271,13 @@ INSERT INTO "@SCHEMA@"."ODBC_FDW_CHARSET_MATRIX" VALUES (37, 'supp_cjk_ext', '�
 INSERT INTO "@SCHEMA@"."ODBC_FDW_CHARSET_MATRIX" VALUES (38, 'supp_adlam', '𞤀𞤡');
 INSERT INTO "@SCHEMA@"."ODBC_FDW_CHARSET_MATRIX" VALUES (39, 'emoji_zwj', '👩‍💻');
 INSERT INTO "@SCHEMA@"."ODBC_FDW_CHARSET_MATRIX" VALUES (40, 'emoji_skin', '👍🏽');
+
+-- Multi-byte LOBs at sizes that cross the read chunk, which an ASCII LOB
+-- fixture cannot exercise: a character count and a byte count agree for ASCII,
+-- and it is exactly their disagreement that this catches. The pattern is 10
+-- characters and 17 UTF-8 bytes, so no size here is a whole number of chunks.
+CREATE COLUMN TABLE "@SCHEMA@"."ODBC_FDW_NCLOB_SIZES" (
+    "ID" INTEGER PRIMARY KEY, "CHARS" INTEGER, "V" NCLOB, "C" CLOB);
+INSERT INTO "@SCHEMA@"."ODBC_FDW_NCLOB_SIZES" VALUES (1,  1000, RPAD('', 1000,  'Grüße 東京 '), RPAD('', 1000, 'ascii '));
+INSERT INTO "@SCHEMA@"."ODBC_FDW_NCLOB_SIZES" VALUES (2,  8000, RPAD('', 8000,  'Grüße 東京 '), RPAD('', 8000, 'ascii '));
+INSERT INTO "@SCHEMA@"."ODBC_FDW_NCLOB_SIZES" VALUES (3, 20000, RPAD('', 20000, 'Grüße 東京 '), RPAD('', 20000, 'ascii '));

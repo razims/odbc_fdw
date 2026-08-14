@@ -13,7 +13,7 @@ other correctness fixes to the upstream lineage.
 | | |
 | --- | --- |
 | Extension | `odbc_fdw` |
-| Release | `1.0.2` |
+| Release | `1.0.3` |
 | PostgreSQL compatibility | PostgreSQL 9.5–18 |
 | Current build and test target | PostgreSQL 18 |
 | Runtime dependency | unixODBC plus an ODBC driver for the remote source |
@@ -29,7 +29,7 @@ verified with the exact driver version used in production.
 The source retains PostgreSQL API compatibility branches from 9.5 through 18.
 The current release suite runs on PostgreSQL 18. The predecessor project's CI
 historically exercised PostgreSQL 9.5 through 12; those results are inherited
-evidence, not a claim that this 1.0.2 tree has been rerun on every older major.
+evidence, not a claim that this 1.0.3 tree has been rerun on every older major.
 PostgreSQL 13 through 17 are covered by the compatibility code but are not yet
 part of the maintained test matrix.
 
@@ -306,7 +306,7 @@ GRANT EXECUTE ON FUNCTION ODBCTablesList(text, integer) TO metadata_reader;
 Upgrade an existing installation to the current release:
 
 ```sql
-ALTER EXTENSION odbc_fdw UPDATE TO '1.0.2';
+ALTER EXTENSION odbc_fdw UPDATE TO '1.0.3';
 ```
 
 ## Type mapping
@@ -318,7 +318,7 @@ ALTER EXTENSION odbc_fdw UPDATE TO '1.0.2';
 | `SQL_CHAR`, `SQL_WCHAR` | `char(n)` |
 | `SQL_VARCHAR`, `SQL_WVARCHAR` | `varchar(n)` or `text` |
 | `SQL_LONGVARCHAR`, `SQL_WLONGVARCHAR` | `text` |
-| `SQL_DECIMAL`, `SQL_NUMERIC` | `decimal(p,s)`, `numeric(p,s)` |
+| `SQL_DECIMAL`, `SQL_NUMERIC` | `decimal(p,s)`, `numeric(p,s)`; unconstrained when the driver states no scale |
 | `SQL_TINYINT`, `SQL_SMALLINT` | `smallint` |
 | `SQL_INTEGER` | `integer` |
 | `SQL_BIGINT` | `bigint` |
@@ -452,6 +452,16 @@ default is the one that changes nothing for an existing installation.
 Drivers that report no wide types at all, such as psqlODBC and SQLite ODBC in
 the suites here, are unaffected by either setting.
 
+**A wide LOB may need the opposite setting from a wide `VARCHAR` on the same
+driver, so set `wide_char_mode` per foreign table where they differ.** Measured
+with SAP HANA Client 2.29.25 on one connection: an `NCLOB` read through
+`SQL_C_CHAR` comes back truncated at its *character* count with `SQL_SUCCESS`
+and no warning — 1000 bytes of a 1666-byte value — while `NVARCHAR` is
+byte-exact through `SQL_C_CHAR` and double encodes through `SQL_C_WCHAR`. Put
+wide LOB columns in a foreign table carrying `wide_char_mode 'wchar'` and leave
+wide `VARCHAR` columns at the default. An ASCII LOB never shows this, because a
+character count and a byte count agree for ASCII.
+
 Floating point columns (`SQL_REAL`, `SQL_FLOAT`, `SQL_DOUBLE`) are retrieved as
 binary values and rendered by PostgreSQL's own float output rather than by the
 driver. A driver's text rendering is not required to round-trip the value: one
@@ -522,7 +532,7 @@ credential-free development gate.
 ## Versioning
 
 The annotated git tag, `default_version`, base SQL filename, Makefile `DATA`,
-and upgrade path use the same version. This release is `1.0.2`.
+and upgrade path use the same version. This release is `1.0.3`.
 
 Every release changes that version:
 

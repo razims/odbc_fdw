@@ -860,6 +860,16 @@ odbcIterateForeignScan(ForeignScanState *node)
 				 * The server option is explicit because drivers disagree here
 				 * and some return corrupt text rather than an error for the
 				 * unsupported choice, making automatic fallback unsafe.
+				 *
+				 * A wide LOB may need the OPPOSITE target from a wide VARCHAR
+				 * on the SAME driver, which is why this is not defaulted per
+				 * type. Measured, SAP HANA Client 2.29.25: an NCLOB read
+				 * through SQL_C_CHAR comes back truncated at its CHARACTER
+				 * count with SQL_SUCCESS and no warning -- 1000 bytes of a
+				 * 1666-byte value -- while the same connection returns NVARCHAR
+				 * byte-exact through SQL_C_CHAR and double encodes it through
+				 * SQL_C_WCHAR. Set wide_char_mode 'wchar' on the foreign TABLE
+				 * holding wide LOBs; see the README.
 				 */
 				conversion = WIDE_TEXT_CONVERSION;
 			}
@@ -889,6 +899,35 @@ odbcIterateForeignScan(ForeignScanState *node)
 				SQLULEN max_size = MAXIMUM_BUFFER_SIZE;
 				SQLULEN display_size = odbc_display_size(stmt,
 				                                         (SQLUSMALLINT) i);
+
+				/*
+				 * Derive a decimal's own floor rather than depending on the
+				 * driver to report one.
+				 *
+				 * A decimal rendered as text needs its digits, plus one
+				 * character for a sign and one for a decimal point. That is
+				 * ODBC's own display-size definition for SQL_DECIMAL and
+				 * SQL_NUMERIC -- precision + 2 -- so computing it here asks the
+				 * driver for nothing and agrees with every driver that does
+				 * answer: SAP HANA, psqlODBC, MySQL Connector/ODBC and
+				 * Microsoft ODBC Driver 18 all report exactly column size + 2.
+				 *
+				 * SQLColAttribute is optional in a way SQLDescribeCol is not,
+				 * and a driver that declines it leaves odbc_display_size at 0.
+				 * Sizing would then fall back to max(precision, 32) -- the old
+				 * budget -- and a negative DECIMAL(32,0) at 33 characters would
+				 * be truncated to 32 all over again. Reported from the field
+				 * exactly there: "the driver reported 33 bytes and delivered
+				 * 32". The refusal that reported it is the safety net working,
+				 * but the value is what the caller wanted, so widen the buffer
+				 * and let the read succeed.
+				 */
+				if ((DataTypePtr == SQL_DECIMAL ||
+				     DataTypePtr == SQL_NUMERIC) &&
+				    ColumnSizePtr > 0 &&
+				    ColumnSizePtr <= (SQLULEN) (MAXIMUM_BUFFER_SIZE - 2) &&
+				    display_size < ColumnSizePtr + 2)
+					display_size = ColumnSizePtr + 2;
 
 				col_position_mask = lappend_int(col_position_mask, mapped_pos);
 				/*

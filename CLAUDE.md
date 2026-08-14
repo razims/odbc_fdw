@@ -210,6 +210,17 @@ That is the whole argument for the option existing. A driver returning
 corrupted text instead of an error cannot be distinguished from one returning
 the truth, so no amount of evidence from other drivers licenses a default.
 
+A wide LOB may need the OPPOSITE target from a wide VARCHAR on the SAME driver,
+so this cannot be defaulted per type either. Measured, SAP HANA Client 2.29.25,
+one connection: `NCLOB` through `SQL_C_CHAR` returns a value truncated at its
+CHARACTER count with `SQL_SUCCESS` and no warning -- 1000 bytes of a 1666-byte
+value, 14 bytes of a 14-character one -- while `SQL_C_WCHAR` returns it whole as
+real UTF-16. `NVARCHAR` on the same connection is the reverse. Defaulting wide
+LOBs to the wide target was implemented and reverted: it fixed the LOBs and broke
+a passing `type_matrix` assertion, so it needs measurement this session could not
+finish. Wide LOBs are covered by a foreign table carrying
+`wide_char_mode 'wchar'`, and the plain table beside it is the negative control.
+
 The driver's own `CHAR_AS_UTF8` connection property does the SAME DAMAGE, and it
 is worth knowing before recommending it: passed through as
 `odbc_CHAR_AS_UTF8 'TRUE'`, it produces byte-for-byte the same double encoding

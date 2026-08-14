@@ -78,6 +78,34 @@ PostgreSQL prints for the value and the driver's rendering leaves the path.
 `float4` is kept separate from `float8`: widening a real to a double would print
 `0.10000000149011612` where PostgreSQL prints `0.1`.
 
+Fixed — a decimal was still truncated when the driver would not report a display
+size:
+
+`SQL_DESC_DISPLAY_SIZE` is optional in a way `SQLDescribeCol` is not, and a
+driver that declines it left the buffer at `max(precision, 32)` — the old budget
+— so a negative `DECIMAL(32,0)` at 33 characters was truncated to 32 again. The
+refusal added above caught it (`the driver reported 33 bytes and delivered 32`),
+but a refusal is not the value the caller wanted. The floor is now DERIVED from
+the column size as `precision + 2`, which is ODBC's own display-size definition
+for `SQL_DECIMAL` and `SQL_NUMERIC` and asks the driver for nothing. Verified by
+disabling the display-size query outright: released 1.0.3 refuses, and with the
+derived floor `DECIMAL(32,0)` and `DECIMAL(38,2)` both return exact at full
+precision in both signs.
+
+Documented — wide LOBs need `wide_char_mode 'wchar'` on SAP HANA:
+
+Not a change in behaviour and not a regression: it is present in 1.0.2 and
+earlier, and it was found by extending the LOB fixtures past ASCII. On one
+connection the same driver needs opposite C types for its two wide types. An
+`NCLOB` read through `SQL_C_CHAR` returns a value truncated at its CHARACTER
+count with `SQL_SUCCESS` and no warning — 1000 bytes of a 1666-byte value —
+while `NVARCHAR` is byte-exact through `SQL_C_CHAR` and double encodes through
+`SQL_C_WCHAR`. Put wide LOB columns in a foreign table carrying
+`wide_char_mode 'wchar'`. The suite now proves the remedy at 1000, 8000 and
+20000 characters against HANA's own `HASH_MD5`, with the plain table beside it
+as the negative control. An ASCII LOB cannot show this, which is why a
+100,000-character LOB test passed for so long.
+
 Fixed — an imported decimal was constrained to a scale the driver never stated:
 
 `SQLColumns` reports `DECIMAL_DIGITS` as NULL for a type where it does not

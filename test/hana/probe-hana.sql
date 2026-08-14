@@ -270,6 +270,19 @@ SERVER hana OPTIONS (
     schema :'hana_schema', table 'ODBC_FDW_CHARSET_MATRIX', id 'ID',
     script_name 'SCRIPT_NAME', value 'VALUE'
 );
+CREATE FOREIGN TABLE probe.nclob_sizes (id integer, chars integer, v text, c text)
+SERVER hana OPTIONS (schema :'hana_schema', table 'ODBC_FDW_NCLOB_SIZES',
+    wide_char_mode 'wchar', id 'ID', chars 'CHARS', v 'V', c 'C');
+-- Truth computed BY HANA and transferred as ASCII hex, so the comparison cannot
+-- be corrupted by the same path it is checking.
+SELECT format(
+    'SELECT "ID", LENGTH("V") AS "HANA_CHARS", LENGTH(TO_BINARY("V")) AS "HANA_BYTES", '
+    'LOWER(BINTOHEX(HASH_MD5(TO_BINARY("V")))) AS "HANA_MD5" FROM %I."ODBC_FDW_NCLOB_SIZES"',
+    :'hana_schema') AS nclob_truth_query \gset
+CREATE FOREIGN TABLE probe.nclob_truth (id integer, hana_chars integer, hana_bytes integer, hana_md5 text)
+SERVER hana OPTIONS (table 'nclob_truth', sql_query :'nclob_truth_query',
+  id 'ID', hana_chars 'HANA_CHARS', hana_bytes 'HANA_BYTES', hana_md5 'HANA_MD5');
+
 CREATE SCHEMA imported_scale;
 IMPORT FOREIGN SCHEMA :"hana_schema" LIMIT TO ("ODBC_FDW_SCALE_MATRIX")
     FROM SERVER hana INTO imported_scale;
@@ -445,6 +458,21 @@ SELECT 'charset_matrix=' || CASE WHEN (
     AND (SELECT octet_length(value) FROM probe.charset_matrix WHERE script_name = 'supp_emoji') = 8
     AND (SELECT length(value) FROM probe.charset_matrix WHERE script_name = 'emoji_zwj') = 3
     AND (SELECT length(value) FROM probe.charset_matrix WHERE script_name = 'combining') = 4
+    THEN 'ok' ELSE 'bad' END;
+
+-- Multi-byte LOBs compared against HANA's own MD5 of its own bytes, through a
+-- table carrying wide_char_mode 'wchar'. That option is REQUIRED here and the
+-- table above is the negative control: the same NCLOB read through the default
+-- SQL_C_CHAR comes back truncated at its CHARACTER count, SQL_SUCCESS, no
+-- warning -- 1000 bytes of a 1666-byte value. An ASCII LOB never shows it,
+-- because a character count and a byte count agree for ASCII.
+SELECT 'nclob_sizes=' || CASE WHEN (
+    SELECT count(*) FROM probe.nclob_sizes s JOIN probe.nclob_truth t USING (id)
+    WHERE md5(s.v) IS DISTINCT FROM t.hana_md5
+       OR length(s.v) IS DISTINCT FROM t.hana_chars
+       OR octet_length(s.v) IS DISTINCT FROM t.hana_bytes) = 0
+    AND (SELECT count(*) FROM probe.nclob_sizes) = 3
+    AND (SELECT length(c) FROM probe.nclob_sizes WHERE id = 3) = 20000
     THEN 'ok' ELSE 'bad' END;
 
 -- An imported column whose remote scale is unstated must not be constrained to
